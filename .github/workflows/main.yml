@@ -1,4 +1,4 @@
-name: Build Win95 Extractor (Open Watcom)
+name: Build Win95 Extractor (Open Watcom V2 Fixed)
 
 on:
   push:
@@ -13,53 +13,72 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Install Open Watcom v2
+      - name: Setup Open Watcom V2
         run: |
-          # Open Watcomコンパイラをダウンロードしてセットアップ
-          wget https://github.com/open-watcom/open-watcom-v2/releases/download/Last-CI-build/ow-snapshot.tar.gz
+          # 正しいURL (.tar.xz) からダウンロード
+          wget https://github.com/open-watcom/open-watcom-v2/releases/download/Last-CI-build/ow-snapshot.tar.xz
+          
+          # 解凍用ディレクトリ作成
           mkdir watcom
-          tar -xzf ow-snapshot.tar.gz -C watcom
-          # 実行権限を付与
+          
+          # .tar.xz 形式を解凍 (Jオプションまたは自動判別のxfを使用)
+          tar -xf ow-snapshot.tar.xz -C watcom
+          
+          # 実行権限の付与 (Linuxホスト用バイナリ)
           chmod +x watcom/binl64/*
 
-      - name: Create C Source
+      - name: Create C Source Code
         run: |
-          # ソースコードの生成 (リポジトリにファイルがあるならこのステップは削除可)
+          # Windows 95のメモリ制約(とファイルシステムの遅さ)を考慮したコード生成
           cat << 'EOF' > extractor.c
           #include <windows.h>
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
-          
+
           #define DEST_DIR "C:\\SAYONARA"
           
+          // Win95実機でのメモリ不足回避のため20MB以上のファイルはスキップ
+          #define MAX_FILE_SIZE (20 * 1024 * 1024)
+
           void ExtractImages(char *filepath, char *filename) {
               FILE *fp = fopen(filepath, "rb");
               if (!fp) return;
+
               fseek(fp, 0, SEEK_END);
               long filesize = ftell(fp);
               fseek(fp, 0, SEEK_SET);
-          
-              unsigned char *buffer = (unsigned char *)malloc(filesize);
-              if (!buffer) {
-                  printf("Skip: %s (Mem)\n", filename);
+
+              if (filesize > MAX_FILE_SIZE) {
+                  printf("Skip (Too Large): %s\n", filename);
                   fclose(fp);
                   return;
               }
+
+              unsigned char *buffer = (unsigned char *)malloc(filesize);
+              if (!buffer) {
+                  printf("Skip (No Mem): %s\n", filename);
+                  fclose(fp);
+                  return;
+              }
+
               fread(buffer, 1, filesize, fp);
               fclose(fp);
-          
+
               int count = 0;
               long i = 0;
               char outpath[MAX_PATH];
+              
               printf("Scanning: %s\n", filename);
-          
+
               while (i < filesize - 6) {
-                  // BMP (BM) check
+                  // BMP (BM) Header Search
                   if (buffer[i] == 'B' && buffer[i+1] == 'M') {
                       unsigned long bmpSize = *(unsigned long *)&buffer[i + 2];
-                      if (bmpSize > 54 && bmpSize < 10000000 && (i + bmpSize) <= filesize) {
+                      // バッファオーバーラン防止チェック
+                      if (bmpSize > 54 && (i + bmpSize) <= filesize) {
                           unsigned long headerSize = *(unsigned long *)&buffer[i + 14];
+                          // Win3.1/95 (40) or OS/2 (12) header
                           if (headerSize == 40 || headerSize == 12) {
                               sprintf(outpath, "%s\\%s_%04d.bmp", DEST_DIR, filename, count++);
                               FILE *out = fopen(outpath, "wb");
@@ -67,61 +86,59 @@ jobs:
                           }
                       }
                   }
-                  // JPEG (FF D8) check
+                  // JPEG (FF D8 ... FF D9) Search
                   else if (buffer[i] == 0xFF && buffer[i+1] == 0xD8) {
                       long start = i;
                       long end = -1;
                       long j = start + 2;
+                      // EOI探索
                       while (j < filesize - 1) {
                           if (buffer[j] == 0xFF && buffer[j+1] == 0xD9) { end = j + 2; break; }
                           j++;
                       }
-                      if (end != -1) {
-                          if (end - start > 100) {
-                              sprintf(outpath, "%s\\%s_%04d.jpg", DEST_DIR, filename, count++);
-                              FILE *out = fopen(outpath, "wb");
-                              if (out) { fwrite(&buffer[start], 1, end - start, out); fclose(out); i = end - 1; }
-                          }
+                      if (end != -1 && (end - start > 100)) {
+                          sprintf(outpath, "%s\\%s_%04d.jpg", DEST_DIR, filename, count++);
+                          FILE *out = fopen(outpath, "wb");
+                          if (out) { fwrite(&buffer[start], 1, end - start, out); fclose(out); i = end - 1; }
                       }
                   }
                   i++;
               }
               free(buffer);
-              if (count > 0) printf(" -> %d images\n", count);
+              if (count > 0) printf(" -> Extracted %d images.\n", count);
           }
-          
+
           int main() {
               WIN32_FIND_DATA findFileData;
               HANDLE hFind;
               char searchPath[MAX_PATH];
-              
-              printf("=== SAYONARA EXTRACTOR (Win95) ===\n");
-              
-              // フォルダ作成
+
+              printf("=== SAYONARA EXTRACTOR (Win95/Watcom) ===\n");
+
               if (!CreateDirectory(DEST_DIR, NULL)) {
                   if (GetLastError() != ERROR_ALREADY_EXISTS) {
-                      printf("Warning: Could not create %s\n", DEST_DIR);
+                      printf("Note: Output folder already exists or error.\n");
                   }
               }
-              
-              // 全ファイル検索
+
               GetCurrentDirectory(MAX_PATH, searchPath);
               strcat(searchPath, "\\*.*");
-              
+
               hFind = FindFirstFile(searchPath, &findFileData);
               if (hFind == INVALID_HANDLE_VALUE) {
                   printf("No files found.\n");
                   return 1;
               }
-              
+
               do {
                   if (!(findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
                       ExtractImages(findFileData.cFileName, findFileData.cFileName);
                   }
               } while (FindNextFile(hFind, &findFileData));
-              
+
               FindClose(hFind);
-              printf("Done.\n");
+              printf("Done. Press Enter to exit.\n");
+              getchar();
               return 0;
           }
           EOF
@@ -132,16 +149,14 @@ jobs:
           export WATCOM=$PWD/watcom
           export PATH=$WATCOM/binl64:$WATCOM/binw:$PATH
           export INCLUDE=$WATCOM/h:$WATCOM/h/nt
-          
+
           # コンパイル実行
-          # wcl386: コンパイラコマンド
-          # -l=nt: Windows NT/95用コンソールアプリを指定
-          # -fe=sayonara95.exe: 出力ファイル名
-          # -6r: Pentium Pro以前の互換性を維持しつつ最適化 (i486互換)
-          wcl386 -q -l=nt -fe=sayonara95.exe extractor.c
+          # -l=nt : Windows 95/NT用ターゲット
+          # -3r   : 386プロセッサ用コード生成 (Win95互換性の要)
+          wcl386 extractor.c -l=nt -3r -fe=sayonara95.exe
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SayonaraExtractor-Win95-Watcom
+          name: SayonaraExtractor-Win95-Fixed
           path: sayonara95.exe

@@ -1,4 +1,4 @@
-name: Build PC-98 Japanese Direct VRAM
+name: Build PC-98 Embedded Font Graphic
 
 on:
   push:
@@ -13,14 +13,89 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Install NASM
+      - name: Install Dependencies
+        # 画像処理ライブラリ(Pillow)と、日本語フォント(Noto Sans)をインストール
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm
+          sudo apt-get install -y nasm python3-pil fonts-noto-cjk
+
+      - name: Generate VRAM Data (Python)
+        # ここで「文字の画像」を作ります
+        run: |
+          python3 - <<EOF
+          from PIL import Image, ImageDraw, ImageFont
+          import struct
+
+          # PC-98の画面サイズ (640x400)
+          WIDTH, HEIGHT = 640, 400
+          
+          # 画像を作成 (1bitモノクロ: 0=黒, 1=白)
+          image = Image.new("1", (WIDTH, HEIGHT), 0)
+          draw = ImageDraw.Draw(image)
+          
+          # フォント読み込み (Ubuntuに入れたNotoSansを使用)
+          # サイズは16px (PC-98の標準的な文字サイズに近い)
+          try:
+              font = ImageFont.truetype("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 16)
+          except:
+              # フォールバック
+              font = ImageFont.load_default()
+
+          # 表示するメッセージ
+          text = """
+          YUKI.N> これをあなたが読んでいる時、
+          わたしはわたしではないだろう。
+          
+          YUKI.N> このメッセージが表示されたということは、
+          そこには、あなた、わたし、涼宮ハルヒ、朝比奈みくる、
+          古泉一樹が存在しているはずである。
+          
+          YUKI.N> それが鍵。
+          あなたは解答を見つけ出した。
+          
+          YUKI.N> これは緊急脱出プログラムである。
+          起動させる場合はエンターキーを、
+          そうでない場合はそれ以外のキーを選択せよ。
+          
+          YUKI.N> 起動させた場合、
+          あなたは時空修正の機会を得る。
+          ただし成功は保証できない。
+          また帰還の保証もできない。
+          
+          YUKI.N> このプログラムが起動するのは一度きりである。
+          実行ののち、消去される。
+          
+          Ready?
+          """
+
+          # 文字を描画 (位置は左上 (0,0) から)
+          # 行間を少し空けて読みやすくします
+          y_text = 10
+          for line in text.split('\n'):
+              draw.text((10, y_text), line, font=font, fill=1)
+              y_text += 20 # 行送り
+
+          # --- PC-98 VRAM形式への変換 ---
+          # PC-98のグラフィックVRAMは「プレーン方式」です。
+          # 1バイトに横8ピクセルが詰まっています。
+          # Pythonの tobytes("raw") は1ピクセル1バイトになりがちなので、
+          # 1bitパック形式に変換する必要があります。
+          
+          # image.tobytes() for mode '1' packs 8 pixels per byte, which is what we want!
+          # ただし、PC-98のVRAM構造に合わせて配置する必要があります。
+          
+          raw_data = image.tobytes()
+          
+          # ファイルに保存
+          with open('vram.bin', 'wb') as f:
+              f.write(raw_data)
+              
+          print(f"Generated vram.bin size: {len(raw_data)} bytes")
+          EOF
 
       - name: Create Assembly Source
         run: |
-          cat << 'EOF' > source_utf8.asm
+          cat << 'EOF' > loader.asm
           cpu 8086
           org 0x0000
 
@@ -29,125 +104,70 @@ jobs:
               cli
               mov ax, cs
               mov ds, ax
+              mov es, ax
               mov ss, ax
               mov sp, 0xFFFE
               sti
 
-              ; --- 1. 画面モード初期化 (BIOS) ---
-              ; 解像度設定だけはBIOSに任せるのが安全です
-              mov ah, 0x0A
-              mov al, 0x00    ; 400ラインモード
+              ; --- 1. グラフィックモード設定 (640x400 Color) ---
+              mov ah, 0x42    ; Set Mode
+              mov ch, 0xC0    ; 640x400 Color Mode
               int 0x18
 
-              ; --- 2. 画面の色設定 (Direct VRAM A200) ---
-              ; BIOSを使わず、属性メモリを直接塗りつぶします
-              mov ax, 0xA200
-              mov es, ax      ; ES = Attribute VRAM
-              xor di, di
-              mov cx, 4000    ; 80文字 x 25行 x 2バイト = 4000
-              mov al, 0xE1    ; 属性: 背景=青(E), 文字=白(1)
-              rep stosb
-
-              ; --- 3. 画面の文字消去 (Direct VRAM A000) ---
-              mov ax, 0xA000
-              mov es, ax      ; ES = Character Code VRAM
-              xor di, di
-              mov cx, 4000
-              mov al, 0x20    ; Space
-              rep stosb
-
-              ; --- 4. カーソルを消す ---
-              mov ah, 0x13
-              mov dx, 0       ; OFF
+              ; --- 2. 画面表示ON ---
+              mov ah, 0x40    ; Display Control
+              mov al, 0x00    ; Show
               int 0x18
-
-              ; --- 5. 文字列表示 (Direct VRAM Loop) ---
-              mov ax, 0xA000
-              mov es, ax      ; ESを文字VRAMに戻す
-              xor di, di      ; 画面左上(0)から
-              mov si, message_data
-
-          print_loop:
-              lodsb           ; 文字読み込み (AL = char)
-              or al, al       ; 終了(0)チェック
-              jz wait_loop
-
-              ; 改行コードチェック (0x0D = CR)
-              cmp al, 0x0D
-              je handle_newline
-              cmp al, 0x0A    ; 0x0A(LF)は無視
-              je print_loop
-
-              ; VRAMへ書き込み
-              stosb           ; [ES:DI] = AL, DI++
               
-              ; 演出用ウェイト
-              call delay
-              jmp print_loop
+              ; --- 3. VRAM転送 (画像の表示) ---
+              ; 作成した vram.bin (32000バイト) を
+              ; 青(B), 赤(R), 緑(G) の3つのプレーン全てに書き込みます。
+              ; 光の三原色ですべて書き込むと「白」になります。
 
-          handle_newline:
-              ; 現在のDIの位置から、次の行の先頭を計算する
-              ; PC-98のテキストVRAMは 1行 = 80バイト (偶数・奇数アドレス連続)
-              
-              mov ax, di
-              mov cl, 80      ; 1行の幅
-              div cl          ; AX / 80 -> AL=行数, AH=余り
-              
-              inc al          ; 次の行へ
-              
-              mov ah, 0
-              mul cl          ; 行数 * 80 = 新しいアドレス
-              mov di, ax      ; DI更新
-              
-              jmp print_loop
+              ; コピー元のデータアドレス
+              mov si, vram_image
 
-          wait_loop:
+              ; -- Blue Plane (A800) --
+              mov ax, 0xA800
+              mov es, ax
+              call copy_plane
+
+              ; -- Red Plane (B000) --
+              mov ax, 0xB000
+              mov es, ax
+              call copy_plane
+
+              ; -- Green Plane (B800) --
+              mov ax, 0xB800
+              mov es, ax
+              call copy_plane
+
+              ; --- 4. 完了ループ ---
+          halt_loop:
               cli
               hlt
-              jmp wait_loop
+              jmp halt_loop
 
-          delay:
-              push cx
-              push ax
-              mov cx, 0x5000  ; 表示スピード調整
-          d1:
-              nop
-              loop d1
-              pop ax
-              pop cx
+              ; --- サブルーチン: 1プレーン分(32000バイト)コピー ---
+          copy_plane:
+              push si         ; SI(元データ)を保存しておく
+              xor di, di      ; 書き込み先は 0x0000 から
+              mov cx, 32000   ; 画面全体のバイト数 (640*400/8)
+              
+              ; 高速転送 (MOVSB)
+              rep movsb
+              
+              pop si          ; SIを復帰 (次のプレーンのために)
               ret
 
           section .data
-          message_data:
-              ; 日本語テキスト (Shift-JISに変換されて格納されます)
-              db "YUKI.N> これをあなたが読んでいる時、", 0x0D
-              db "わたしはわたしではないだろう。", 0x0D
-              db 0x0D
-              db "YUKI.N> このメッセージが表示されたということは、", 0x0D
-              db "そこには、あなた、わたし、涼宮ハルヒ、朝比奈みくる、", 0x0D
-              db "古泉一樹が存在しているはずである。", 0x0D
-              db 0x0D
-              db "YUKI.N> それが鍵。", 0x0D
-              db "あなたは解答を見つけ出した。", 0x0D
-              db 0x0D
-              db "YUKI.N> これは緊急脱出プログラムである。", 0x0D
-              db "起動させる場合はエンターキーを、", 0x0D
-              db "そうでない場合はそれ以外のキーを選択せよ。", 0x0D
-              db 0x0D
-              db "YUKI.N> 起動させた場合、", 0x0D
-              db "あなたは時空修正の機会を得る。", 0x0D
-              db "ただし成功は保証できない。", 0x0D
-              db "また帰還の保証もできない。", 0x0D, 0x0D
-              db "Ready?", 0
+          ; Pythonで作った画像データをここに埋め込む
+          vram_image:
+              incbin "vram.bin"
           EOF
 
-      - name: Convert Encoding to Shift-JIS
-        # 【重要】ソースコードをShift-JISに変換します
-        # これをやらないと、VRAMに正しい値が入らず文字化けします
-        run: iconv -f UTF-8 -t CP932 source_utf8.asm -o yuki.asm
-
       - name: Assemble
-        run: nasm yuki.asm -f bin -o yuki.bin
+        run: nasm loader.asm -f bin -o yuki.bin
 
       - name: Create HDM Image
         run: |
@@ -155,6 +175,12 @@ jobs:
           disk_size = 1261568
           with open('yuki.bin', 'rb') as f:
               code = f.read()
+          
+          # サイズチェック (フロッピーに入るか)
+          print(f"Code size: {len(code)} bytes")
+          if len(code) > disk_size:
+              raise Exception("Error: Image is too large for floppy disk!")
+
           padding = b'\x00' * (disk_size - len(code))
           with open('YUKI_N.hdm', 'wb') as f:
               f.write(code)
@@ -164,5 +190,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YUKI_N_JP_Direct
+          name: YUKI_N_GraphicFont
           path: YUKI_N.hdm

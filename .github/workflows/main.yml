@@ -1,59 +1,120 @@
-name: Extract Shizuku Music Data
+name: Build Win95 Extractor
 
 on:
   push:
-    paths:
-      - '**/*.hdi'
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
-  extract-and-process:
+  build-win95:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-
-      - name: Find HDI file
-        id: find_hdi
+      - name: Install MinGW-w64 (Cross Compiler)
         run: |
-          HDI_FILE=$(find . -name "*.hdi" | head -n 1)
-          if [ -z "$HDI_FILE" ]; then
-            echo "No HDI file found!"
-            exit 1
-          fi
-          echo "hdi_path=$HDI_FILE" >> $GITHUB_ENV
-          echo "Found HDI: $HDI_FILE"
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-i686
 
-      - name: Run Extraction Script
+      - name: Create C Source
         run: |
-          # 上記のPythonスクリプトをファイルとして保存
-          cat << 'EOF' > extract_hdi.py
-          import struct, os, sys
-          # ... (ここに上記のPythonコードの中身を貼り付けるか、リポジトリに含めてください) ...
-          # 長くなるため、ここでは簡略化してファイルが存在すると仮定して実行します
-          EOF
+          # 上記のCコードをファイルに書き出し
+          cat << 'EOF' > extractor_win95.c
+          #include <windows.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
           
-          # 注意: 実際の運用では extract_hdi.py をリポジトリにコミットしておくことを推奨
-          python extract_hdi.py "${{ env.hdi_path }}"
+          #define DEST_DIR "C:\\SAYONARA"
+          
+          void ExtractImages(char *filepath, char *filename) {
+              FILE *fp = fopen(filepath, "rb");
+              if (!fp) return;
+              fseek(fp, 0, SEEK_END);
+              long filesize = ftell(fp);
+              fseek(fp, 0, SEEK_SET);
+          
+              unsigned char *buffer = (unsigned char *)malloc(filesize);
+              if (!buffer) {
+                  printf("Skipped (Memory): %s\n", filename);
+                  fclose(fp);
+                  return;
+              }
+              fread(buffer, 1, filesize, fp);
+              fclose(fp);
+          
+              int count = 0;
+              long i = 0;
+              char outpath[MAX_PATH];
+              printf("Scanning: %s ...\n", filename);
+          
+              while (i < filesize - 6) {
+                  // BMP (BM) Search
+                  if (buffer[i] == 'B' && buffer[i+1] == 'M') {
+                      unsigned long bmpSize = *(unsigned long *)&buffer[i + 2];
+                      if (bmpSize > 54 && bmpSize < 10000000 && (i + bmpSize) <= filesize) {
+                          unsigned long headerSize = *(unsigned long *)&buffer[i + 14];
+                          if (headerSize == 40 || headerSize == 12) {
+                              sprintf(outpath, "%s\\%s_%04d.bmp", DEST_DIR, filename, count++);
+                              FILE *out = fopen(outpath, "wb");
+                              if (out) { fwrite(&buffer[i], 1, bmpSize, out); fclose(out); i += bmpSize - 1; }
+                          }
+                      }
+                  }
+                  // JPEG (FF D8) Search
+                  else if (buffer[i] == 0xFF && buffer[i+1] == 0xD8) {
+                      long start = i;
+                      long end = -1;
+                      long j = start + 2;
+                      while (j < filesize - 1) {
+                          if (buffer[j] == 0xFF && buffer[j+1] == 0xD9) { end = j + 2; break; }
+                          j++;
+                      }
+                      if (end != -1) {
+                          if (end - start > 100) {
+                              sprintf(outpath, "%s\\%s_%04d.jpg", DEST_DIR, filename, count++);
+                              FILE *out = fopen(outpath, "wb");
+                              if (out) { fwrite(&buffer[start], 1, end - start, out); fclose(out); i = end - 1; }
+                          }
+                      }
+                  }
+                  i++;
+              }
+              free(buffer);
+              if (count > 0) printf(" -> Extracted %d images.\n", count);
+          }
+          
+          int main() {
+              WIN32_FIND_DATA findFileData;
+              HANDLE hFind;
+              char searchPath[MAX_PATH];
+              printf("=== WIN95 EXTRACTOR ===\n");
+              CreateDirectory(DEST_DIR, NULL);
+              GetCurrentDirectory(MAX_PATH, searchPath);
+              strcat(searchPath, "\\*.*");
+              hFind = FindFirstFile(searchPath, &findFileData);
+              if (hFind == INVALID_HANDLE_VALUE) return 1;
+              do {
+                  if (!(findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                      ExtractImages(findFileData.cFileName, findFileData.cFileName);
+                  }
+              } while (FindNextFile(hFind, &findFileData));
+              FindClose(hFind);
+              printf("Finished. Press Enter.");
+              getchar();
+              return 0;
+          }
+          EOF
 
-      - name: Check Extracted Files
+      - name: Compile for Windows 95
         run: |
-          ls -R extracted_music/ || echo "No files extracted"
+          # 32bitコンパイル, 静的リンク, サブシステム4.0(Win95)指定
+          i686-w64-mingw32-gcc extractor_win95.c -o sayonara95.exe -static -O2 -m32 -Wl,--subsystem,console:4.0
 
-      - name: Upload Extracted Music Data
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: shizuku-bgm-raw
-          path: extracted_music/
-          retention-days: 5
-
-      - name: Explanation for MP3 Conversion
-        run: |
-          echo "::warning::Extracted files are raw FM synth data (.M, .LMD, etc.)."
-          echo "::notice::To convert to MP3, use FMPMD2000 or Neko Project II on your local PC with the extracted files."
+          name: SayonaraExtractor-Win95
+          path: sayonara95.exe

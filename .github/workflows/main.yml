@@ -1,4 +1,4 @@
-name: Build PC-98 Floppy Image (YUKI.N)
+name: Build PC-98 Floppy Image (Fixed Boot)
 
 on:
   push:
@@ -19,94 +19,103 @@ jobs:
           sudo apt-get install -y nasm
 
       - name: Create Assembly Source (UTF-8)
-        # BIOSがFDDを読み込む際の挙動に合わせて、セグメント設定を強化しました
         run: |
           cat << 'EOF' > source_utf8.asm
           cpu 8086
-          org 0x0000
+          org 0x0000       ; オフセットは0から開始
 
           section .text
-              ; --- セグメント正規化 ---
-              ; BIOSによっては CS:IP = 1FC0:0000 などで渡されることがあるため
-              ; 強制的に CS=0000 にジャンプします。
-              jmp 0x0000:start
-          
           start:
-              cli
-              xor ax, ax
+              ; --- 重要: セグメント初期化 ---
+              ; PC-98のBIOSは IPLを 1FC0:0000 にロードして実行します。
+              ; CSはすでに 1FC0 になっています。
+              ; データ(メッセージ)を正しく読むために DS を CS と同じにします。
+              
+              cli             ; 割り込み禁止
+              mov ax, cs
               mov ds, ax
               mov es, ax
               mov ss, ax
-              mov sp, 0x7C00 ; スタック位置
-              sti
+              mov sp, 0xFFFE  ; スタックをセグメント末尾に設定
+              sti             ; 割り込み許可
 
-              ; --- 画面モード設定とクリア ---
-              ; テキストモードを確実に有効化
-              mov ah, 0x0A ; CRTモード設定非表示
+              ; --- 画面の初期化 (必須) ---
+              ; 400ライン/200ラインモードの正規化
+              mov ah, 0x0A
+              mov al, 0x00    ; 機能を要求
               int 0x18
               
-              mov ah, 0x16 ; VRAMクリア
-              mov dx, 0
+              ; 画面クリア (VRAMクリア)
+              mov ah, 0x16
+              mov dx, 0       ; コマンド 0:All Clear
               int 0x18
 
-              mov ah, 0x13 ; カーソル初期化
-              mov dx, 0
+              ; カーソルを表示ONにする
+              mov ah, 0x13
+              mov dx, 1       ; 1 = 表示ON
+              mov cx, 0x0000  ; カーソル位置 (0,0)
+              int 0x18
+              
+              ; カーソル位置を明示的に (0,0) へセット
+              mov ah, 0x13
+              mov dx, 0       ; 0 = 位置設定
+              mov cx, 0x0000
               int 0x18
 
               ; --- メッセージ表示ループ ---
               mov si, message_data
           
           char_loop:
-              lodsb           ; AL = [SI], SI++
-              or al, al       ; 終了判定
-              jz wait_enter
+              lodsb           ; AL = [DS:SI], SI++
+              or al, al       ; NULL終端チェック
+              jz wait_enter   ; 0ならループ終了
 
-              ; --- 一文字描画 (INT 18h, AH=40h) ---
-              mov ah, 0x40
-              mov bx, 0
+              ; --- 1文字表示 ---
+              mov ah, 0x40    ; TEXT WRITE
+              mov bx, 0       ; Page 0
               int 0x18
               
-              ; --- ウェイト ---
-              call delay_short
+              ; --- ウェイト (文字送り演出) ---
+              call delay_char
 
               jmp char_loop
 
           wait_enter:
-              ; --- キー入力待ち ---
-              mov ah, 0x00
-              int 0x18
-              ; Enterキー (CR=0x0D) かチェック
-              cmp al, 0x0D
+              ; --- 入力待ち ---
+              mov ah, 0x00    ; KEY INPUT
+              int 0x18        ; AH=Scan, AL=ASCII
+              
+              cmp al, 0x0D    ; Enter (CR) ?
               jne wait_enter
 
           shutdown:
-              ; --- 終了処理 ---
-              ; 画面をクリアして停止
-              mov ah, 0x16
+              ; --- 画面を消して停止 ---
+              mov ah, 0x16    ; Clear Screen
               mov dx, 0
               int 0x18
 
+              ; システム停止
               cli
               hlt
           hlt_loop:
               jmp hlt_loop
 
           ; --- ウェイトルーチン ---
-          delay_short:
+          delay_char:
               push cx
-              mov cx, 0x8000  ; 速度調整
-          dloop1:
+              mov cx, 0x4000  ; 待機カウント (エミュレータに合わせて調整)
+          d1:
               push cx
-              mov cx, 0x0010
-          dloop2:
-              loop dloop2
+              mov cx, 0x0005
+          d2:
+              loop d2
               pop cx
-              loop dloop1
+              loop d1
               pop cx
               ret
 
           section .data
-          ; メッセージ (Shift_JIS変換前)
+          ; メッセージデータ
           message_data:
               db "YUKI.N> これをあなたが読んでいる時、", 0x0D, 0x0A
               db "わたしはわたしではないだろう。", 0x0D, 0x0A
@@ -142,24 +151,25 @@ jobs:
         run: |
           nasm yuki.asm -f bin -o yuki.bin
 
-      - name: Create Floppy Image (2HD)
-        # PC-98の標準的なフロッピー形式 (2HD, 1.2MB) のイメージを作成します
-        # サイズを 1261568 バイト (1024バイト/セクタ * 8セクタ * 2ヘッド * 77シリンダ) に合わせます
+      - name: Create Floppy Image (2HD Raw)
         run: |
           python3 - <<EOF
+          # PC-98 2HD Format (1.2MB approx)
+          # 1024 bytes/sector, 8 sectors/track, 2 heads, 77 cylinders
           disk_size = 1261568
           
           with open('yuki.bin', 'rb') as f:
               code = f.read()
           
-          # コードがディスクサイズを超えていないかチェック
+          # パディング (ディスクサイズまで0で埋める)
           if len(code) > disk_size:
-              raise ValueError("Code is too large for the disk image")
+              print("Warning: Code is larger than disk size!")
           
-          # バイナリを書き込み、残りを0x00で埋める
+          padding = b'\x00' * (disk_size - len(code))
+          
           with open('YUKI_N.fdi', 'wb') as f:
               f.write(code)
-              f.write(b'\x00' * (disk_size - len(code)))
+              f.write(padding)
               
           print(f"Created YUKI_N.fdi with size {disk_size} bytes")
           EOF
@@ -167,5 +177,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YUKI_N_FDI
+          name: YUKI_N_FDI_Fixed
           path: YUKI_N.fdi

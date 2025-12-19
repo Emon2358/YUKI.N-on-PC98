@@ -1,4 +1,4 @@
-name: Build PC-98 Floppy Image (Fixed Boot)
+name: Build PC-98 D88 (No Reset Needed)
 
 on:
   push:
@@ -10,100 +10,100 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Install dependencies
+      - name: Install NASM
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm
 
-      - name: Create Assembly Source (UTF-8)
+      - name: Create Assembly Source
+        # 起動直後に画面の色設定を強制的に上書きし、黒画面バグを回避します
         run: |
           cat << 'EOF' > source_utf8.asm
           cpu 8086
-          org 0x0000       ; オフセットは0から開始
+          org 0x0000
 
           section .text
           start:
-              ; --- 重要: セグメント初期化 ---
-              ; PC-98のBIOSは IPLを 1FC0:0000 にロードして実行します。
-              ; CSはすでに 1FC0 になっています。
-              ; データ(メッセージ)を正しく読むために DS を CS と同じにします。
-              
-              cli             ; 割り込み禁止
+              ; --- セグメントの安全な初期化 ---
+              cli
               mov ax, cs
               mov ds, ax
               mov es, ax
               mov ss, ax
-              mov sp, 0xFFFE  ; スタックをセグメント末尾に設定
-              sti             ; 割り込み許可
+              mov sp, 0xFFFE
+              sti
 
-              ; --- 画面の初期化 (必須) ---
-              ; 400ライン/200ラインモードの正規化
-              mov ah, 0x0A
-              mov al, 0x00    ; 機能を要求
-              int 0x18
-              
-              ; 画面クリア (VRAMクリア)
-              mov ah, 0x16
-              mov dx, 0       ; コマンド 0:All Clear
-              int 0x18
-
-              ; カーソルを表示ONにする
-              mov ah, 0x13
-              mov dx, 1       ; 1 = 表示ON
-              mov cx, 0x0000  ; カーソル位置 (0,0)
-              int 0x18
-              
-              ; カーソル位置を明示的に (0,0) へセット
-              mov ah, 0x13
-              mov dx, 0       ; 0 = 位置設定
-              mov cx, 0x0000
-              int 0x18
-
-              ; --- メッセージ表示ループ ---
-              mov si, message_data
-          
-          char_loop:
-              lodsb           ; AL = [DS:SI], SI++
-              or al, al       ; NULL終端チェック
-              jz wait_enter   ; 0ならループ終了
-
-              ; --- 1文字表示 ---
-              mov ah, 0x40    ; TEXT WRITE
-              mov bx, 0       ; Page 0
-              int 0x18
-              
-              ; --- ウェイト (文字送り演出) ---
-              call delay_char
-
-              jmp char_loop
-
-          wait_enter:
-              ; --- 入力待ち ---
-              mov ah, 0x00    ; KEY INPUT
-              int 0x18        ; AH=Scan, AL=ASCII
-              
-              cmp al, 0x0D    ; Enter (CR) ?
-              jne wait_enter
-
-          shutdown:
-              ; --- 画面を消して停止 ---
-              mov ah, 0x16    ; Clear Screen
+              ; --- 起動確認音 (ピポッ) ---
+              ; 画面が真っ暗でも、音が鳴れば「動いている」とわかります
+              mov ah, 0x18
               mov dx, 0
               int 0x18
 
-              ; システム停止
+              ; --- 画面モードの強制リセット ---
+              mov ah, 0x0A
+              mov al, 0x00    ; 400ラインモード
+              int 0x18
+
+              ; --- VRAM全消去 ---
+              mov ah, 0x16
+              mov dx, 0
+              int 0x18
+
+              ; --- カーソル表示 ---
+              mov ah, 0x13
+              mov dx, 1       ; 表示ON
+              mov cx, 0x0000
+              int 0x18
+              
+              ; --- テキスト色を「白」に強制固定 ---
+              ; 一部のエミュレータで文字色が黒になるのを防ぐため
+              ; テキストアトリビュート領域(A200:0000)を直接書き換えます
+              push es
+              mov ax, 0xA200  ; テキスト属性セグメント
+              mov es, ax
+              xor di, di      ; オフセット 0
+              mov cx, 4000    ; 画面全体分
+              mov al, 0xE1    ; 属性: 背景=青(E), 文字=白(1)
+              rep stosb       ; 書き込み実行
+              pop es
+
+              ; --- メッセージ表示 ---
+              mov si, message_data
+          
+          char_loop:
+              lodsb
+              or al, al
+              jz wait_enter
+
+              ; BIOSで文字出力
+              mov ah, 0x40
+              mov bx, 0
+              int 0x18
+              
+              call delay_char
+              jmp char_loop
+
+          wait_enter:
+              mov ah, 0x00
+              int 0x18
+              cmp al, 0x0D
+              jne wait_enter
+
+          shutdown:
+              mov ah, 0x16
+              mov dx, 0
+              int 0x18
               cli
               hlt
           hlt_loop:
               jmp hlt_loop
 
-          ; --- ウェイトルーチン ---
           delay_char:
               push cx
-              mov cx, 0x4000  ; 待機カウント (エミュレータに合わせて調整)
+              mov cx, 0x3000
           d1:
               push cx
               mov cx, 0x0005
@@ -115,7 +115,6 @@ jobs:
               ret
 
           section .data
-          ; メッセージデータ
           message_data:
               db "YUKI.N> これをあなたが読んでいる時、", 0x0D, 0x0A
               db "わたしはわたしではないだろう。", 0x0D, 0x0A
@@ -143,39 +142,53 @@ jobs:
               db "Ready?", 0
           EOF
 
-      - name: Convert Encoding (UTF-8 to Shift_JIS)
-        run: |
-          iconv -f UTF-8 -t SHIFT-JIS source_utf8.asm -o yuki.asm
+      - name: Convert Encoding
+        run: iconv -f UTF-8 -t SHIFT-JIS source_utf8.asm -o yuki.asm
 
       - name: Assemble
-        run: |
-          nasm yuki.asm -f bin -o yuki.bin
+        run: nasm yuki.asm -f bin -o yuki.bin
 
-      - name: Create Floppy Image (2HD Raw)
+      - name: Create D88 Disk Image
+        # エミュレータが確実に認識するD88ヘッダを付与します
         run: |
           python3 - <<EOF
-          # PC-98 2HD Format (1.2MB approx)
-          # 1024 bytes/sector, 8 sectors/track, 2 heads, 77 cylinders
-          disk_size = 1261568
+          import struct
           
+          # D88形式のヘッダ (688バイト)
+          header = bytearray(688)
+          
+          # ディスク名 (16バイト)
+          disk_name = b"YUKI_N_BOOT"
+          header[0:len(disk_name)] = disk_name
+          
+          # 0x1A: ライトプロテクトなし(00)
+          # 0x1B: メディア種別 2HD (20)
+          header[0x1B] = 0x20
+          
+          # 0x1C: ディスクサイズ (4バイト)
+          disk_size = 688 + 1261568  # ヘッダ + データ
+          struct.pack_into('<I', header, 0x1C, disk_size)
+          
+          # トラックポインタテーブル (簡易的にすべて0詰めでも多くのエミュは読むが、念のため)
+          # np2 wasmはヘッダさえあればRawとして読んでくれることが多い
+          
+          # バイナリデータの準備
           with open('yuki.bin', 'rb') as f:
               code = f.read()
-          
-          # パディング (ディスクサイズまで0で埋める)
-          if len(code) > disk_size:
-              print("Warning: Code is larger than disk size!")
-          
-          padding = b'\x00' * (disk_size - len(code))
-          
-          with open('YUKI_N.fdi', 'wb') as f:
-              f.write(code)
-              f.write(padding)
               
-          print(f"Created YUKI_N.fdi with size {disk_size} bytes")
+          # ディスクデータ本体 (2HD = 1,261,568 bytes)
+          raw_disk = bytearray(1261568)
+          raw_disk[0:len(code)] = code
+          
+          with open('YUKI_N.d88', 'wb') as f:
+              f.write(header)
+              f.write(raw_disk)
+              
+          print("Created YUKI_N.d88")
           EOF
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YUKI_N_FDI_Fixed
-          path: YUKI_N.fdi
+          name: YUKI_N_D88
+          path: YUKI_N.d88

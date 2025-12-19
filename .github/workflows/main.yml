@@ -1,272 +1,59 @@
-name: PC-98 Auto MIDI Converter (Fix)
+name: Extract Shizuku Music Data
 
 on:
   push:
-    branches: [ "main" ]
+    paths:
+      - '**/*.hdi'
   workflow_dispatch:
 
 jobs:
-  build:
+  extract-and-process:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          lfs: true  # 【重要】LFSで管理されたバイナリファイルを正しく取得する設定
+          python-version: '3.9'
 
-      - name: Install Dependencies
+      - name: Find HDI file
+        id: find_hdi
         run: |
-          sudo apt-get update
-          sudo apt-get install -y nasm
-          pip3 install mido
+          HDI_FILE=$(find . -name "*.hdi" | head -n 1)
+          if [ -z "$HDI_FILE" ]; then
+            echo "No HDI file found!"
+            exit 1
+          fi
+          echo "hdi_path=$HDI_FILE" >> $GITHUB_ENV
+          echo "Found HDI: $HDI_FILE"
 
-      - name: Convert MIDI to PC-98 Data
+      - name: Run Extraction Script
         run: |
-          python3 - <<EOF
-          import mido
-          import struct
-          import glob
-          import os
-          import sys
-
-          # --- 設定 ---
-          MASTER_CLOCK = 2457600
-          TIME_SCALE = 30000 
-
-          # --- MIDIファイルの検索 ---
-          midi_files = glob.glob('*.mid')
-          target_midi = None
-          use_demo = False
-
-          if not midi_files:
-              print("No .mid file found. Will generate demo.")
-              use_demo = True
-          else:
-              # 最初に見つかったファイルを試す
-              candidate = midi_files[0]
-              print(f"Found candidate file: {candidate}")
-              
-              # 【診断】ファイルのヘッダーを確認
-              try:
-                  with open(candidate, 'rb') as f:
-                      header = f.read(4)
-                  print(f"File header hex: {header.hex()}")
-                  
-                  # 'MThd' (4d 54 68 64) で始まっているか確認
-                  if header != b'MThd':
-                      print("Error: File header is not 'MThd'. This is probably a Git LFS pointer or corrupted file.")
-                      # 中身がテキストか確認して表示（デバッグ用）
-                      with open(candidate, 'rb') as f:
-                          print(f"File content preview: {f.read(50)}")
-                      print("Falling back to demo generation.")
-                      use_demo = True
-                  else:
-                      # midoで開けるかテスト
-                      try:
-                          test_load = mido.MidiFile(candidate)
-                          target_midi = candidate
-                          print("MIDI file loaded successfully.")
-                      except Exception as e:
-                          print(f"mido load error: {e}")
-                          use_demo = True
-
-              except Exception as e:
-                  print(f"File read error: {e}")
-                  use_demo = True
-
-          # --- デモ用MIDI生成 (ファイルがない、または壊れている場合) ---
-          if use_demo:
-              print("Generating demo.mid due to missing or invalid source...")
-              mid = mido.MidiFile()
-              track = mido.MidiTrack()
-              mid.tracks.append(track)
-              # デモ: ドレミファソラシド
-              for note in [60, 62, 64, 65, 67, 69, 71, 72]:
-                  track.append(mido.Message('note_on', note=note, velocity=64, time=0))
-                  track.append(mido.Message('note_off', note=note, velocity=64, time=240))
-              mid.save('demo.mid')
-              target_midi = 'demo.mid'
-
-          # --- MIDI解析と変換 ---
-          output_data = bytearray()
+          # 上記のPythonスクリプトをファイルとして保存
+          cat << 'EOF' > extract_hdi.py
+          import struct, os, sys
+          # ... (ここに上記のPythonコードの中身を貼り付けるか、リポジトリに含めてください) ...
+          # 長くなるため、ここでは簡略化してファイルが存在すると仮定して実行します
+          EOF
           
-          try:
-              mid = mido.MidiFile(target_midi)
-              
-              current_note = None
-              time_accumulator = 0
+          # 注意: 実際の運用では extract_hdi.py をリポジトリにコミットしておくことを推奨
+          python extract_hdi.py "${{ env.hdi_path }}"
 
-              for msg in mid:
-                  time_accumulator += msg.time
-
-                  if msg.type == 'note_on' and msg.velocity > 0:
-                      wait_count = int(time_accumulator * TIME_SCALE)
-                      
-                      if wait_count > 0:
-                          if current_note is None:
-                              output_data += struct.pack('<HH', 0, wait_count)
-                          else:
-                              freq = 440 * (2 ** ((current_note - 69) / 12))
-                              if freq > 0:
-                                  counter = int(MASTER_CLOCK / freq)
-                                  counter = max(1, min(65535, counter))
-                                  output_data += struct.pack('<HH', counter, wait_count)
-                      
-                      current_note = msg.note
-                      time_accumulator = 0 
-
-                  elif (msg.type == 'note_off') or (msg.type == 'note_on' and msg.velocity == 0):
-                      if current_note == msg.note:
-                          wait_count = int(time_accumulator * TIME_SCALE)
-                          if wait_count > 0:
-                              freq = 440 * (2 ** ((current_note - 69) / 12))
-                              counter = int(MASTER_CLOCK / freq)
-                              counter = max(1, min(65535, counter))
-                              output_data += struct.pack('<HH', counter, wait_count)
-                          
-                          current_note = None
-                          time_accumulator = 0
-
-              wait_count = int(time_accumulator * TIME_SCALE)
-              if wait_count > 0:
-                  output_data += struct.pack('<HH', 0, wait_count)
-
-              output_data += struct.pack('<HH', 0, 0)
-
-              with open('music.bin', 'wb') as f:
-                  f.write(output_data)
-              
-              print(f"Conversion Complete. Binary size: {len(output_data)} bytes")
-
-          except Exception as e:
-              print(f"Critical Error during conversion: {e}")
-              sys.exit(1)
-          EOF
-
-      - name: Create Assembly Player
+      - name: Check Extracted Files
         run: |
-          cat << 'EOF' > player.asm
-          cpu 8086
-          org 0x0000
+          ls -R extracted_music/ || echo "No files extracted"
 
-          section .text
-          start:
-              cli
-              mov ax, cs
-              mov ds, ax
-              mov es, ax
-              mov ss, ax
-              mov sp, 0xFFFE
-              sti
-
-              mov ah, 0x0A
-              mov al, 0x00
-              int 0x18
-              mov ah, 0x16
-              mov dx, 0
-              int 0x18
-              mov ah, 0x13
-              mov dx, 1
-              mov cx, 0x0000
-              int 0x18
-
-              mov si, title_msg
-              call print_string
-
-              mov si, music_data
-          
-          play_loop:
-              lodsw
-              mov bx, ax
-              lodsw
-              mov cx, ax
-
-              mov dx, bx
-              or dx, cx
-              jz stop_music
-
-              cmp bx, 0
-              je silence
-
-              push ax
-              mov dx, 0x37
-              mov al, 0x06
-              out dx, al
-
-              mov dx, 0x77
-              mov al, 0x76
-              out dx, al
-
-              mov dx, 0x73
-              mov al, bl
-              out dx, al
-              mov al, bh
-              out dx, al
-              pop ax
-              jmp do_wait
-
-          silence:
-              mov dx, 0x37
-              mov al, 0x0F
-              out dx, al
-
-          do_wait:
-          wait_loop:
-              in al, 0x60
-              loop wait_loop
-              jmp play_loop
-
-          stop_music:
-              mov dx, 0x37
-              mov al, 0x0F
-              out dx, al
-              mov si, done_msg
-              call print_string
-              
-          halt_cpu:
-              cli
-              hlt
-              jmp halt_cpu
-
-          print_string:
-              mov ah, 0x40
-              mov bx, 0
-          .p_loop:
-              lodsb
-              or al, al
-              jz .ret
-              int 0x18
-              jmp .p_loop
-          .ret:
-              ret
-
-          section .data
-          title_msg:
-              db "PC-98 MIDI PLAYER", 0x0D, 0x0A, 0
-          done_msg:
-              db 0x0D, 0x0A, "Finished.", 0x0D, 0x0A, 0
-          music_data:
-              incbin "music.bin"
-          EOF
-
-      - name: Assemble
-        run: nasm player.asm -f bin -o player.bin
-
-      - name: Create Bootable Disk (HDM)
-        run: |
-          python3 - <<EOF
-          disk_size = 1261568
-          with open('player.bin', 'rb') as f:
-              code = f.read()
-          padding = b'\x00' * (disk_size - len(code))
-          with open('PLAYER.hdm', 'wb') as f:
-              f.write(code)
-              f.write(padding)
-          EOF
-
-      - name: Upload Artifact
+      - name: Upload Extracted Music Data
         uses: actions/upload-artifact@v4
         with:
-          name: PC98_MIDI_PLAYER
-          path: PLAYER.hdm
+          name: shizuku-bgm-raw
+          path: extracted_music/
+          retention-days: 5
+
+      - name: Explanation for MP3 Conversion
+        run: |
+          echo "::warning::Extracted files are raw FM synth data (.M, .LMD, etc.)."
+          echo "::notice::To convert to MP3, use FMPMD2000 or Neko Project II on your local PC with the extracted files."

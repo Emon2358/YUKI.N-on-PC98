@@ -1,4 +1,4 @@
-name: Build PC-98 Force Display (English/HDM)
+name: Build PC-98 English Interface (No Mojibake)
 
 on:
   push:
@@ -34,101 +34,118 @@ jobs:
               mov sp, 0xFFFE
               sti
 
-              ; --- 1. 起動音 (動いているかの確認) ---
-              mov ah, 0x18
-              mov dx, 0
-              int 0x18
-
-              ; --- 2. 画面モード初期化 ---
+              ; --- 画面設定 ---
               mov ah, 0x0A
-              mov al, 0x00    ; 400ライン
+              mov al, 0x00    ; 400ラインモード
               int 0x18
 
-              ; --- 3. 画面を「青背景・白文字」で埋め尽くす ---
-              ; BIOSのclsではなく、直接メモリを書き換えて色を強制します
+              ; --- VRAM直接操作で画面をクリア ---
+              ; BIOSに頼らず、メモリを直接書き換えることで確実に表示させます
               
-              ; テキストVRAM (文字コード) のクリア
+              ; 1. 文字コード領域(A000)をスペースで埋める
               mov ax, 0xA000
               mov es, ax
               xor di, di
               mov cx, 2000    ; 2000文字分
-              mov al, 0x20    ; スペース
+              mov al, 0x20    ; Space
               rep stosb
 
-              ; テキスト属性 (色) の強制設定
+              ; 2. 属性領域(A200)を「青背景・白文字」で埋める
               mov ax, 0xA200
               mov es, ax
               xor di, di
               mov cx, 2000
-              ; 属性バイト: 0xE1 (背景=青, 文字=白, 点滅なし)
-              ; これで画面全体が「青く」なるはずです
-              mov al, 0xE1    
+              mov al, 0xE1    ; Blue Background, White Text
               rep stosb
 
-              ; --- 4. 文字を表示 (英語のみ) ---
-              ; 漢字ROMがない可能性を考慮し、ASCIIだけで書きます
-              mov si, message_data
-              mov di, 0       ; 画面左上から
+              ; --- カーソルを消す ---
+              mov ah, 0x13
+              mov dx, 0       ; OFF
+              int 0x18
+
+              ; --- メッセージ表示開始 ---
+              ; ダイレクトVRAM書き込みで行います
               
-              ; セグメント設定: ES=0xA000 (文字VRAM)
-              mov ax, 0xA000
+              mov ax, 0xA000  ; 文字領域
               mov es, ax
-
-          print_loop:
-              lodsb           ; 文字読み込み
-              or al, al
-              jz halt_loop    ; 0なら終了
-
-              cmp al, 0x0D    ; 改行(CR)処理
-              je newline
-              cmp al, 0x0A    ; 改行(LF)無視
-              je print_loop
-
-              stosb           ; VRAMに書き込み (ES:DI)
+              xor di, di      ; 画面左上(0)からスタート
               
-              ; ウェイト（文字が流れる演出）
-              call delay
-              jmp print_loop
+              mov si, message_data
 
-          newline:
-              ; 次の行へ (PC-98は1行80文字=80バイト)
-              ; DIの値を次の80の倍数まで進める簡易処理
+          print_char:
+              lodsb           ; 文字を1つ読み込む
+              or al, al       ; 0(終了)かチェック
+              jz ready_prompt
+
+              cmp al, 0x0D    ; 改行コードチェック
+              je new_line
+
+              ; 文字をVRAMに書き込む
+              stosb
+              
+              ; タイプライター風の演出ウェイト
+              call delay
+              jmp print_char
+
+          new_line:
+              ; 改行処理: 現在のDI位置から次の行の先頭へ
+              ; PC-98の1行は80バイト(偶数アドレスのみ使うわけではないので80)
+              ; 正確には A000セグメントでは連続しているので、次の80の倍数へ飛ばす
+              
               mov ax, di
               mov cl, 80
               div cl          ; AX / 80 -> AL=行数, AH=余り
-              inc al          ; 次の行
-              mul cl          ; 行数 * 80
-              mov di, ax      ; 新しい位置
-              jmp print_loop
+              
+              ; 現在の行数 + 1
+              inc al
+              
+              ; 新しいオフセット = (行数 * 80)
+              mov AH, 0
+              mul cl
+              mov di, ax
+              
+              jmp print_char
 
-          halt_loop:
+          ready_prompt:
+              ; 入力待ちループ
               cli
               hlt
-              jmp halt_loop
+              jmp ready_prompt
 
           delay:
               push cx
-              mov cx, 0x4000
-          d1:
-              loop d1
+              push ax
+              mov cx, 0x6000  ; 少しゆっくり表示
+          d_loop:
+              nop
+              loop d_loop
+              pop ax
               pop cx
               ret
 
           section .data
           message_data:
-              db "YUKI.N> Reading this means I am no longer me.", 0x0D
+              db "YUKI.N> If you are reading this,", 0x0D
+              db "YUKI.N> it means I am no longer me.", 0x0D
               db 0x0D
-              db "YUKI.N> This message is an emergency escape program.", 0x0D
-              db "YUKI.N> Press ENTER to activate.", 0x0D
+              db "YUKI.N> The presence of this message implies", 0x0D
+              db "YUKI.N> that you, I, Haruhi Suzumiya, Mikuru Asahina,", 0x0D
+              db "YUKI.N> and Itsuki Koizumi are all here.", 0x0D
               db 0x0D
-              db "YUKI.N> Good luck.", 0x0D
-              db 0x00
+              db "YUKI.N> That is the key.", 0x0D
+              db "YUKI.N> You have found the answer.", 0x0D
+              db 0x0D
+              db "YUKI.N> This is an emergency escape program.", 0x0D
+              db "YUKI.N> Press ENTER to launch.", 0x0D
+              db "YUKI.N> Otherwise, select any other key.", 0x0D
+              db 0x0D
+              db "Ready?", 0
           EOF
 
       - name: Assemble
         run: nasm source_utf8.asm -f bin -o yuki.bin
 
-      - name: Create HDM Image
+      - name: Create HDM Image (Correct Size)
         run: |
           python3 - <<EOF
           disk_size = 1261568
@@ -143,5 +160,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YUKI_N_HDM_ForceBlue
+          name: YUKI_N_English
           path: YUKI_N.hdm

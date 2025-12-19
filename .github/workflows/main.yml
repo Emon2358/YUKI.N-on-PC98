@@ -1,4 +1,4 @@
-name: Build PC-98 Embedded Font Graphic
+name: PC-98 Auto MIDI Converter
 
 on:
   push:
@@ -14,88 +14,117 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install Dependencies
-        # 画像処理ライブラリ(Pillow)と、日本語フォント(Noto Sans)をインストール
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm python3-pil fonts-noto-cjk
+          sudo apt-get install -y nasm
+          pip3 install mido
 
-      - name: Generate VRAM Data (Python)
-        # ここで「文字の画像」を作ります
+      - name: Convert MIDI to PC-98 Data
         run: |
           python3 - <<EOF
-          from PIL import Image, ImageDraw, ImageFont
+          import mido
           import struct
+          import glob
+          import os
 
-          # PC-98の画面サイズ (640x400)
-          WIDTH, HEIGHT = 640, 400
-          
-          # 画像を作成 (1bitモノクロ: 0=黒, 1=白)
-          image = Image.new("1", (WIDTH, HEIGHT), 0)
-          draw = ImageDraw.Draw(image)
-          
-          # フォント読み込み (Ubuntuに入れたNotoSansを使用)
-          # サイズは16px (PC-98の標準的な文字サイズに近い)
-          try:
-              font = ImageFont.truetype("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 16)
-          except:
-              # フォールバック
-              font = ImageFont.load_default()
+          # --- 設定 ---
+          # PC-98のシステムクロック (2.4576MHz)
+          MASTER_CLOCK = 2457600
+          # テンポ補正 (エミュレータの速度に合わせて調整してください)
+          TIME_SCALE = 30000 
 
-          # 表示するメッセージ
-          text = """
-          YUKI.N> これをあなたが読んでいる時、
-          わたしはわたしではないだろう。
+          # --- MIDIファイルの検索 ---
+          midi_files = glob.glob('*.mid')
           
-          YUKI.N> このメッセージが表示されたということは、
-          そこには、あなた、わたし、涼宮ハルヒ、朝比奈みくる、
-          古泉一樹が存在しているはずである。
-          
-          YUKI.N> それが鍵。
-          あなたは解答を見つけ出した。
-          
-          YUKI.N> これは緊急脱出プログラムである。
-          起動させる場合はエンターキーを、
-          そうでない場合はそれ以外のキーを選択せよ。
-          
-          YUKI.N> 起動させた場合、
-          あなたは時空修正の機会を得る。
-          ただし成功は保証できない。
-          また帰還の保証もできない。
-          
-          YUKI.N> このプログラムが起動するのは一度きりである。
-          実行ののち、消去される。
-          
-          Ready?
-          """
+          if not midi_files:
+              print("No .mid file found. Generating demo.mid...")
+              mid = mido.MidiFile()
+              track = mido.MidiTrack()
+              mid.tracks.append(track)
+              # デモ: ドレミファソラシド
+              for note in [60, 62, 64, 65, 67, 69, 71, 72]:
+                  track.append(mido.Message('note_on', note=note, velocity=64, time=0))
+                  track.append(mido.Message('note_off', note=note, velocity=64, time=240))
+              mid.save('demo.mid')
+              target_midi = 'demo.mid'
+          else:
+              target_midi = midi_files[0]
+              print(f"Found MIDI file: {target_midi}")
 
-          # 文字を描画 (位置は左上 (0,0) から)
-          # 行間を少し空けて読みやすくします
-          y_text = 10
-          for line in text.split('\n'):
-              draw.text((10, y_text), line, font=font, fill=1)
-              y_text += 20 # 行送り
+          # --- MIDI解析と変換 ---
+          # 出力フォーマット: [Counter(2byte)] [WaitCount(2byte)] ... [0,0]
+          output_data = bytearray()
+          
+          # PC-98は単音なので、時間経過を管理しながら単一のトラックにマージします
+          mid = mido.MidiFile(target_midi)
+          
+          # 現在鳴っているノート
+          current_note = None
+          time_accumulator = 0
 
-          # --- PC-98 VRAM形式への変換 ---
-          # PC-98のグラフィックVRAMは「プレーン方式」です。
-          # 1バイトに横8ピクセルが詰まっています。
-          # Pythonの tobytes("raw") は1ピクセル1バイトになりがちなので、
-          # 1bitパック形式に変換する必要があります。
+          for msg in mid:
+              # 時間の累積 (秒単位)
+              time_accumulator += msg.time
+
+              if msg.type == 'note_on' and msg.velocity > 0:
+                  # --- 前の音(または休符)を書き込む ---
+                  wait_count = int(time_accumulator * TIME_SCALE)
+                  
+                  if wait_count > 0:
+                      if current_note is None:
+                          # 休符 (Counter=0)
+                          output_data += struct.pack('<HH', 0, wait_count)
+                      else:
+                          # 音符
+                          # f = 440 * 2^((note-69)/12)
+                          freq = 440 * (2 ** ((current_note - 69) / 12))
+                          if freq > 0:
+                              counter = int(MASTER_CLOCK / freq)
+                              # 16bit範囲内に収める
+                              counter = max(1, min(65535, counter))
+                              output_data += struct.pack('<HH', counter, wait_count)
+                  
+                  # 新しい音を開始
+                  current_note = msg.note
+                  time_accumulator = 0 # 時間リセット
+
+              elif (msg.type == 'note_off') or (msg.type == 'note_on' and msg.velocity == 0):
+                  # ノートオフの場合、現在鳴っている音が自分なら音を止める
+                  if current_note == msg.note:
+                      # --- 今までの音を書き込む ---
+                      wait_count = int(time_accumulator * TIME_SCALE)
+                      if wait_count > 0:
+                          # 音符書き込み
+                          freq = 440 * (2 ** ((current_note - 69) / 12))
+                          counter = int(MASTER_CLOCK / freq)
+                          counter = max(1, min(65535, counter))
+                          output_data += struct.pack('<HH', counter, wait_count)
+                      
+                      current_note = None # 音なし状態へ
+                      time_accumulator = 0
+
+          # 最後の余韻
+          wait_count = int(time_accumulator * TIME_SCALE)
+          if wait_count > 0:
+              if current_note:
+                  freq = 440 * (2 ** ((current_note - 69) / 12))
+                  counter = int(MASTER_CLOCK / freq)
+                  output_data += struct.pack('<HH', counter, wait_count)
+              else:
+                  output_data += struct.pack('<HH', 0, wait_count)
+
+          # 終了マーカー
+          output_data += struct.pack('<HH', 0, 0)
+
+          with open('music.bin', 'wb') as f:
+              f.write(output_data)
           
-          # image.tobytes() for mode '1' packs 8 pixels per byte, which is what we want!
-          # ただし、PC-98のVRAM構造に合わせて配置する必要があります。
-          
-          raw_data = image.tobytes()
-          
-          # ファイルに保存
-          with open('vram.bin', 'wb') as f:
-              f.write(raw_data)
-              
-          print(f"Generated vram.bin size: {len(raw_data)} bytes")
+          print(f"Conversion Complete. Binary size: {len(output_data)} bytes")
           EOF
 
-      - name: Create Assembly Source
+      - name: Create Assembly Player
         run: |
-          cat << 'EOF' > loader.asm
+          cat << 'EOF' > player.asm
           cpu 8086
           org 0x0000
 
@@ -109,80 +138,136 @@ jobs:
               mov sp, 0xFFFE
               sti
 
-              ; --- 1. グラフィックモード設定 (640x400 Color) ---
-              mov ah, 0x42    ; Set Mode
-              mov ch, 0xC0    ; 640x400 Color Mode
+              ; --- 画面設定 (黒背景・文字表示) ---
+              mov ah, 0x0A
+              mov al, 0x00
+              int 0x18
+              mov ah, 0x16
+              mov dx, 0
+              int 0x18
+              mov ah, 0x13
+              mov dx, 1
+              mov cx, 0x0000
               int 0x18
 
-              ; --- 2. 画面表示ON ---
-              mov ah, 0x40    ; Display Control
-              mov al, 0x00    ; Show
-              int 0x18
+              ; --- タイトル表示 ---
+              mov si, title_msg
+              call print_string
+
+              ; --- 再生開始 ---
+              mov si, music_data
+          
+          play_loop:
+              ; データ読み込み [Counter(2)][Wait(2)]
+              lodsw           ; AX = Counter
+              mov bx, ax
+              lodsw           ; AX = WaitCount
+              mov cx, ax
+
+              ; 終了判定 (両方0)
+              mov dx, bx
+              or dx, cx
+              jz stop_music
+
+              ; 音程判定 (Counter=0 は休符)
+              cmp bx, 0
+              je silence
+
+              ; --- 音を鳴らす (PIT設定) ---
+              push ax
               
-              ; --- 3. VRAM転送 (画像の表示) ---
-              ; 作成した vram.bin (32000バイト) を
-              ; 青(B), 赤(R), 緑(G) の3つのプレーン全てに書き込みます。
-              ; 光の三原色ですべて書き込むと「白」になります。
+              ; 1. Beep ON (Port 37h bit3=1)
+              mov dx, 0x37
+              mov al, 0x06
+              out dx, al
 
-              ; コピー元のデータアドレス
-              mov si, vram_image
+              ; 2. PIT Mode (Counter 1, Square Wave)
+              mov dx, 0x77
+              mov al, 0x76
+              out dx, al
 
-              ; -- Blue Plane (A800) --
-              mov ax, 0xA800
-              mov es, ax
-              call copy_plane
+              ; 3. Frequency Data
+              mov dx, 0x73
+              mov al, bl      ; Low Byte
+              out dx, al
+              mov al, bh      ; High Byte
+              out dx, al
+              
+              pop ax
+              jmp do_wait
 
-              ; -- Red Plane (B000) --
-              mov ax, 0xB000
-              mov es, ax
-              call copy_plane
+          silence:
+              ; 音を止める
+              mov dx, 0x37
+              mov al, 0x0F
+              out dx, al
 
-              ; -- Green Plane (B800) --
-              mov ax, 0xB800
-              mov es, ax
-              call copy_plane
+          do_wait:
+              ; ウェイト処理 (CX回ループ)
+              ; I/Oポートアクセスで時間を稼ぐ
+          wait_loop:
+              in al, 0x60
+              loop wait_loop
 
-              ; --- 4. 完了ループ ---
-          halt_loop:
+              jmp play_loop
+
+          stop_music:
+              ; 完全に音を止める
+              mov dx, 0x37
+              mov al, 0x0F
+              out dx, al
+              
+              ; 完了メッセージ
+              mov si, done_msg
+              call print_string
+              
+          halt_cpu:
               cli
               hlt
-              jmp halt_loop
+              jmp halt_cpu
 
-              ; --- サブルーチン: 1プレーン分(32000バイト)コピー ---
-          copy_plane:
-              push si         ; SI(元データ)を保存しておく
-              xor di, di      ; 書き込み先は 0x0000 から
-              mov cx, 32000   ; 画面全体のバイト数 (640*400/8)
-              
-              ; 高速転送 (MOVSB)
-              rep movsb
-              
-              pop si          ; SIを復帰 (次のプレーンのために)
+          ; --- 文字列表示ルーチン ---
+          print_string:
+              mov ah, 0x40
+              mov bx, 0
+          .p_loop:
+              lodsb
+              or al, al
+              jz .ret
+              int 0x18
+              jmp .p_loop
+          .ret:
               ret
 
           section .data
-          ; Pythonで作った画像データをここに埋め込む
-          vram_image:
-              incbin "vram.bin"
+          title_msg:
+              db "PC-98 MIDI PLAYER", 0x0D, 0x0A
+              db "Converting and Playing...", 0x0D, 0x0A, 0
+          
+          done_msg:
+              db 0x0D, 0x0A, "Playback Finished.", 0x0D, 0x0A, 0
+
+          ; Pythonで変換した音楽データを取り込む
+          music_data:
+              incbin "music.bin"
           EOF
 
       - name: Assemble
-        run: nasm loader.asm -f bin -o yuki.bin
+        run: nasm player.asm -f bin -o player.bin
 
-      - name: Create HDM Image
+      - name: Create Bootable Disk (HDM)
         run: |
           python3 - <<EOF
           disk_size = 1261568
-          with open('yuki.bin', 'rb') as f:
+          with open('player.bin', 'rb') as f:
               code = f.read()
           
-          # サイズチェック (フロッピーに入るか)
-          print(f"Code size: {len(code)} bytes")
+          # 容量チェック
           if len(code) > disk_size:
-              raise Exception("Error: Image is too large for floppy disk!")
-
+              print("Warning: MIDI data is too large for floppy disk!")
+          
           padding = b'\x00' * (disk_size - len(code))
-          with open('YUKI_N.hdm', 'wb') as f:
+          with open('PLAYER.hdm', 'wb') as f:
               f.write(code)
               f.write(padding)
           EOF
@@ -190,5 +275,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YUKI_N_GraphicFont
-          path: YUKI_N.hdm
+          name: PC98_MIDI_PLAYER
+          path: PLAYER.hdm

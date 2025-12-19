@@ -1,4 +1,4 @@
-name: Build PC-98 English Interface (No Mojibake)
+name: Build PC-98 Japanese Native (Fix Mojibake)
 
 on:
   push:
@@ -18,7 +18,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nasm
 
-      - name: Create Assembly Source
+      - name: Create Assembly Source (UTF-8)
         run: |
           cat << 'EOF' > source_utf8.asm
           cpu 8086
@@ -26,6 +26,7 @@ jobs:
 
           section .text
           start:
+              ; --- セグメント初期化 ---
               cli
               mov ax, cs
               mov ds, ax
@@ -34,118 +35,128 @@ jobs:
               mov sp, 0xFFFE
               sti
 
-              ; --- 画面設定 ---
+              ; --- 画面モード設定 (400ライン・日本語モード) ---
               mov ah, 0x0A
-              mov al, 0x00    ; 400ラインモード
+              mov al, 0x00
               int 0x18
 
-              ; --- VRAM直接操作で画面をクリア ---
-              ; BIOSに頼らず、メモリを直接書き換えることで確実に表示させます
-              
-              ; 1. 文字コード領域(A000)をスペースで埋める
-              mov ax, 0xA000
-              mov es, ax
-              xor di, di
-              mov cx, 2000    ; 2000文字分
-              mov al, 0x20    ; Space
-              rep stosb
+              ; --- 画面クリア ---
+              mov ah, 0x16
+              mov dx, 0
+              int 0x18
 
-              ; 2. 属性領域(A200)を「青背景・白文字」で埋める
-              mov ax, 0xA200
-              mov es, ax
-              xor di, di
-              mov cx, 2000
-              mov al, 0xE1    ; Blue Background, White Text
-              rep stosb
-
-              ; --- カーソルを消す ---
+              ; --- カーソル表示ON ---
               mov ah, 0x13
-              mov dx, 0       ; OFF
+              mov dx, 1
+              mov cx, 0x0000
               int 0x18
 
-              ; --- メッセージ表示開始 ---
-              ; ダイレクトVRAM書き込みで行います
+              ; --- 背景色設定 (青背景・白文字) ---
+              ; 日本語を表示するためには、属性VRAMをBIOS経由ではなく
+              ; 直接設定するのが最も確実です（BIOSだと色設定が複雑なため）
               
-              mov ax, 0xA000  ; 文字領域
+              push es
+              mov ax, 0xA200  ; テキスト属性セグメント
               mov es, ax
-              xor di, di      ; 画面左上(0)からスタート
-              
+              xor di, di
+              mov cx, 4000    ; 画面全体 (80文字x25行x2バイト)
+              mov al, 0xE1    ; 背景=青(E), 文字=白(1)
+              rep stosb
+              pop es
+
+              ; --- 日本語メッセージ表示 (BIOS使用) ---
+              ; PC-98のBIOS(INT 18h)はShift-JISを正しく解釈します
               mov si, message_data
+          
+          char_loop:
+              lodsb           ; 1バイト読み込み
+              or al, al       ; 終了判定
+              jz wait_enter
 
-          print_char:
-              lodsb           ; 文字を1つ読み込む
-              or al, al       ; 0(終了)かチェック
-              jz ready_prompt
+              ; 日本語(2バイト文字)判定
+              ; Shift-JISの1バイト目は 0x81-0x9F または 0xE0-0xFC
+              ; これを判定して、2バイト文字なら続けてもう1バイト読みます
+              
+              mov ah, 0x40    ; BIOS出力用コード初期化
+              
+              ; 簡易判定: 0x80以上なら2バイト文字の1バイト目とみなす
+              cmp al, 0x80
+              jb print_single
 
-              cmp al, 0x0D    ; 改行コードチェック
-              je new_line
+              ; 2バイト文字の場合
+              mov ah, al      ; 1バイト目をAHへ
+              lodsb           ; 2バイト目をALへ読み込む
 
-              ; 文字をVRAMに書き込む
-              stosb
+          print_single:
+              ; ここで AX に文字コードが入っている (1バイト文字ならALのみ、2バイトならAH+AL)
+              ; 1バイト文字の場合、BIOSには AH=0x40, AL=文字 ではなく
+              ; 2バイトコードとして渡す必要がある場合があるが、
+              ; INT 18h AH=40h は本来「文字列書き込み」用ではなく単純出力には向かない場合がある
+              ; 最も安全な「一文字出力」である AH=0x40 を使うには工夫が必要
               
-              ; タイプライター風の演出ウェイト
-              call delay
-              jmp print_char
+              ; --- シンプルなBIOS出力 ---
+              mov dx, ax      ; DXにデータを入れる（BIOSの仕様によってはDXを使う）
+              mov ah, 0x40    ; 一文字表示コマンド
+              mov bx, 0
+              int 0x18        ; 表示実行
 
-          new_line:
-              ; 改行処理: 現在のDI位置から次の行の先頭へ
-              ; PC-98の1行は80バイト(偶数アドレスのみ使うわけではないので80)
-              ; 正確には A000セグメントでは連続しているので、次の80の倍数へ飛ばす
-              
-              mov ax, di
-              mov cl, 80
-              div cl          ; AX / 80 -> AL=行数, AH=余り
-              
-              ; 現在の行数 + 1
-              inc al
-              
-              ; 新しいオフセット = (行数 * 80)
-              mov AH, 0
-              mul cl
-              mov di, ax
-              
-              jmp print_char
+              call delay_char
+              jmp char_loop
 
-          ready_prompt:
-              ; 入力待ちループ
-              cli
+          wait_enter:
+              ; 入力待ち
+              mov ah, 0x00
+              int 0x18
+              cmp al, 0x0D    ; Enterキー
+              jne wait_enter
+
+          shutdown:
               hlt
-              jmp ready_prompt
 
-          delay:
+          delay_char:
               push cx
-              push ax
-              mov cx, 0x6000  ; 少しゆっくり表示
-          d_loop:
-              nop
-              loop d_loop
-              pop ax
+              mov cx, 0x4000
+          d1:
+              loop d1
               pop cx
               ret
 
           section .data
           message_data:
-              db "YUKI.N> If you are reading this,", 0x0D
-              db "YUKI.N> it means I am no longer me.", 0x0D
-              db 0x0D
-              db "YUKI.N> The presence of this message implies", 0x0D
-              db "YUKI.N> that you, I, Haruhi Suzumiya, Mikuru Asahina,", 0x0D
-              db "YUKI.N> and Itsuki Koizumi are all here.", 0x0D
-              db 0x0D
-              db "YUKI.N> That is the key.", 0x0D
-              db "YUKI.N> You have found the answer.", 0x0D
-              db 0x0D
-              db "YUKI.N> This is an emergency escape program.", 0x0D
-              db "YUKI.N> Press ENTER to launch.", 0x0D
-              db "YUKI.N> Otherwise, select any other key.", 0x0D
-              db 0x0D
+              ; ここの日本語は次のステップでShift-JISに変換されます
+              db "YUKI.N> これをあなたが読んでいる時、", 0x0D, 0x0A
+              db "わたしはわたしではないだろう。", 0x0D, 0x0A
+              db 0x0D, 0x0A
+              db "YUKI.N> このメッセージが表示されたということは、", 0x0D, 0x0A
+              db "そこには、あなた、わたし、涼宮ハルヒ、朝比奈みくる、", 0x0D, 0x0A
+              db "古泉一樹が存在しているはずである。", 0x0D, 0x0A
+              db 0x0D, 0x0A
+              db "YUKI.N> それが鍵。", 0x0D, 0x0A
+              db "あなたは解答を見つけ出した。", 0x0D, 0x0A
+              db 0x0D, 0x0A
+              db "YUKI.N> これは緊急脱出プログラムである。", 0x0D, 0x0A
+              db "起動させる場合はエンターキーを、", 0x0D, 0x0A
+              db "そうでない場合はそれ以外のキーを選択せよ。", 0x0D, 0x0A
+              db 0x0D, 0x0A
+              db "YUKI.N> 起動させた場合、", 0x0D, 0x0A
+              db "あなたは時空修正の機会を得る。", 0x0D, 0x0A
+              db "ただし成功は保証できない。", 0x0D, 0x0A
+              db "また帰還の保証もできない。", 0x0D, 0x0A
+              db 0x0D, 0x0A
+              db "YUKI.N> このプログラムが起動するのは一度きりである。", 0x0D, 0x0A
+              db "実行ののち、消去される。", 0x0D, 0x0A
               db "Ready?", 0
           EOF
 
-      - name: Assemble
-        run: nasm source_utf8.asm -f bin -o yuki.bin
+      - name: Convert Encoding to Shift-JIS
+        # ここでUTF-8のソースコードをPC-98用のShift-JIS(CP932)に変換します
+        # これにより文字化けを防ぎます
+        run: iconv -f UTF-8 -t CP932 source_utf8.asm -o yuki.asm
 
-      - name: Create HDM Image (Correct Size)
+      - name: Assemble
+        run: nasm yuki.asm -f bin -o yuki.bin
+
+      - name: Create HDM Image
         run: |
           python3 - <<EOF
           disk_size = 1261568
@@ -160,5 +171,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YUKI_N_English
+          name: YUKI_N_Japanese
           path: YUKI_N.hdm

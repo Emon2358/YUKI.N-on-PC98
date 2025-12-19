@@ -1,4 +1,4 @@
-name: Build PC-98 Japanese Native (Fix Mojibake)
+name: Build PC-98 Japanese Direct VRAM
 
 on:
   push:
@@ -18,7 +18,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nasm
 
-      - name: Create Assembly Source (UTF-8)
+      - name: Create Assembly Source
         run: |
           cat << 'EOF' > source_utf8.asm
           cpu 8086
@@ -26,131 +26,124 @@ jobs:
 
           section .text
           start:
-              ; --- セグメント初期化 ---
               cli
               mov ax, cs
               mov ds, ax
-              mov es, ax
               mov ss, ax
               mov sp, 0xFFFE
               sti
 
-              ; --- 画面モード設定 (400ライン・日本語モード) ---
+              ; --- 1. 画面モード初期化 (BIOS) ---
+              ; 解像度設定だけはBIOSに任せるのが安全です
               mov ah, 0x0A
-              mov al, 0x00
+              mov al, 0x00    ; 400ラインモード
               int 0x18
 
-              ; --- 画面クリア ---
-              mov ah, 0x16
-              mov dx, 0
-              int 0x18
-
-              ; --- カーソル表示ON ---
-              mov ah, 0x13
-              mov dx, 1
-              mov cx, 0x0000
-              int 0x18
-
-              ; --- 背景色設定 (青背景・白文字) ---
-              ; 日本語を表示するためには、属性VRAMをBIOS経由ではなく
-              ; 直接設定するのが最も確実です（BIOSだと色設定が複雑なため）
-              
-              push es
-              mov ax, 0xA200  ; テキスト属性セグメント
-              mov es, ax
+              ; --- 2. 画面の色設定 (Direct VRAM A200) ---
+              ; BIOSを使わず、属性メモリを直接塗りつぶします
+              mov ax, 0xA200
+              mov es, ax      ; ES = Attribute VRAM
               xor di, di
-              mov cx, 4000    ; 画面全体 (80文字x25行x2バイト)
-              mov al, 0xE1    ; 背景=青(E), 文字=白(1)
+              mov cx, 4000    ; 80文字 x 25行 x 2バイト = 4000
+              mov al, 0xE1    ; 属性: 背景=青(E), 文字=白(1)
               rep stosb
-              pop es
 
-              ; --- 日本語メッセージ表示 (BIOS使用) ---
-              ; PC-98のBIOS(INT 18h)はShift-JISを正しく解釈します
-              mov si, message_data
-          
-          char_loop:
-              lodsb           ; 1バイト読み込み
-              or al, al       ; 終了判定
-              jz wait_enter
+              ; --- 3. 画面の文字消去 (Direct VRAM A000) ---
+              mov ax, 0xA000
+              mov es, ax      ; ES = Character Code VRAM
+              xor di, di
+              mov cx, 4000
+              mov al, 0x20    ; Space
+              rep stosb
 
-              ; 日本語(2バイト文字)判定
-              ; Shift-JISの1バイト目は 0x81-0x9F または 0xE0-0xFC
-              ; これを判定して、2バイト文字なら続けてもう1バイト読みます
-              
-              mov ah, 0x40    ; BIOS出力用コード初期化
-              
-              ; 簡易判定: 0x80以上なら2バイト文字の1バイト目とみなす
-              cmp al, 0x80
-              jb print_single
-
-              ; 2バイト文字の場合
-              mov ah, al      ; 1バイト目をAHへ
-              lodsb           ; 2バイト目をALへ読み込む
-
-          print_single:
-              ; ここで AX に文字コードが入っている (1バイト文字ならALのみ、2バイトならAH+AL)
-              ; 1バイト文字の場合、BIOSには AH=0x40, AL=文字 ではなく
-              ; 2バイトコードとして渡す必要がある場合があるが、
-              ; INT 18h AH=40h は本来「文字列書き込み」用ではなく単純出力には向かない場合がある
-              ; 最も安全な「一文字出力」である AH=0x40 を使うには工夫が必要
-              
-              ; --- シンプルなBIOS出力 ---
-              mov dx, ax      ; DXにデータを入れる（BIOSの仕様によってはDXを使う）
-              mov ah, 0x40    ; 一文字表示コマンド
-              mov bx, 0
-              int 0x18        ; 表示実行
-
-              call delay_char
-              jmp char_loop
-
-          wait_enter:
-              ; 入力待ち
-              mov ah, 0x00
+              ; --- 4. カーソルを消す ---
+              mov ah, 0x13
+              mov dx, 0       ; OFF
               int 0x18
-              cmp al, 0x0D    ; Enterキー
-              jne wait_enter
 
-          shutdown:
+              ; --- 5. 文字列表示 (Direct VRAM Loop) ---
+              mov ax, 0xA000
+              mov es, ax      ; ESを文字VRAMに戻す
+              xor di, di      ; 画面左上(0)から
+              mov si, message_data
+
+          print_loop:
+              lodsb           ; 文字読み込み (AL = char)
+              or al, al       ; 終了(0)チェック
+              jz wait_loop
+
+              ; 改行コードチェック (0x0D = CR)
+              cmp al, 0x0D
+              je handle_newline
+              cmp al, 0x0A    ; 0x0A(LF)は無視
+              je print_loop
+
+              ; VRAMへ書き込み
+              stosb           ; [ES:DI] = AL, DI++
+              
+              ; 演出用ウェイト
+              call delay
+              jmp print_loop
+
+          handle_newline:
+              ; 現在のDIの位置から、次の行の先頭を計算する
+              ; PC-98のテキストVRAMは 1行 = 80バイト (偶数・奇数アドレス連続)
+              
+              mov ax, di
+              mov cl, 80      ; 1行の幅
+              div cl          ; AX / 80 -> AL=行数, AH=余り
+              
+              inc al          ; 次の行へ
+              
+              mov ah, 0
+              mul cl          ; 行数 * 80 = 新しいアドレス
+              mov di, ax      ; DI更新
+              
+              jmp print_loop
+
+          wait_loop:
+              cli
               hlt
+              jmp wait_loop
 
-          delay_char:
+          delay:
               push cx
-              mov cx, 0x4000
+              push ax
+              mov cx, 0x5000  ; 表示スピード調整
           d1:
+              nop
               loop d1
+              pop ax
               pop cx
               ret
 
           section .data
           message_data:
-              ; ここの日本語は次のステップでShift-JISに変換されます
-              db "YUKI.N> これをあなたが読んでいる時、", 0x0D, 0x0A
-              db "わたしはわたしではないだろう。", 0x0D, 0x0A
-              db 0x0D, 0x0A
-              db "YUKI.N> このメッセージが表示されたということは、", 0x0D, 0x0A
-              db "そこには、あなた、わたし、涼宮ハルヒ、朝比奈みくる、", 0x0D, 0x0A
-              db "古泉一樹が存在しているはずである。", 0x0D, 0x0A
-              db 0x0D, 0x0A
-              db "YUKI.N> それが鍵。", 0x0D, 0x0A
-              db "あなたは解答を見つけ出した。", 0x0D, 0x0A
-              db 0x0D, 0x0A
-              db "YUKI.N> これは緊急脱出プログラムである。", 0x0D, 0x0A
-              db "起動させる場合はエンターキーを、", 0x0D, 0x0A
-              db "そうでない場合はそれ以外のキーを選択せよ。", 0x0D, 0x0A
-              db 0x0D, 0x0A
-              db "YUKI.N> 起動させた場合、", 0x0D, 0x0A
-              db "あなたは時空修正の機会を得る。", 0x0D, 0x0A
-              db "ただし成功は保証できない。", 0x0D, 0x0A
-              db "また帰還の保証もできない。", 0x0D, 0x0A
-              db 0x0D, 0x0A
-              db "YUKI.N> このプログラムが起動するのは一度きりである。", 0x0D, 0x0A
-              db "実行ののち、消去される。", 0x0D, 0x0A
+              ; 日本語テキスト (Shift-JISに変換されて格納されます)
+              db "YUKI.N> これをあなたが読んでいる時、", 0x0D
+              db "わたしはわたしではないだろう。", 0x0D
+              db 0x0D
+              db "YUKI.N> このメッセージが表示されたということは、", 0x0D
+              db "そこには、あなた、わたし、涼宮ハルヒ、朝比奈みくる、", 0x0D
+              db "古泉一樹が存在しているはずである。", 0x0D
+              db 0x0D
+              db "YUKI.N> それが鍵。", 0x0D
+              db "あなたは解答を見つけ出した。", 0x0D
+              db 0x0D
+              db "YUKI.N> これは緊急脱出プログラムである。", 0x0D
+              db "起動させる場合はエンターキーを、", 0x0D
+              db "そうでない場合はそれ以外のキーを選択せよ。", 0x0D
+              db 0x0D
+              db "YUKI.N> 起動させた場合、", 0x0D
+              db "あなたは時空修正の機会を得る。", 0x0D
+              db "ただし成功は保証できない。", 0x0D
+              db "また帰還の保証もできない。", 0x0D, 0x0D
               db "Ready?", 0
           EOF
 
       - name: Convert Encoding to Shift-JIS
-        # ここでUTF-8のソースコードをPC-98用のShift-JIS(CP932)に変換します
-        # これにより文字化けを防ぎます
+        # 【重要】ソースコードをShift-JISに変換します
+        # これをやらないと、VRAMに正しい値が入らず文字化けします
         run: iconv -f UTF-8 -t CP932 source_utf8.asm -o yuki.asm
 
       - name: Assemble
@@ -171,5 +164,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YUKI_N_Japanese
+          name: YUKI_N_JP_Direct
           path: YUKI_N.hdm

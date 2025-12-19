@@ -1,4 +1,4 @@
-name: Build PC-98 D88 (No Reset Needed)
+name: Build PC-98 HDM Image
 
 on:
   push:
@@ -19,7 +19,6 @@ jobs:
           sudo apt-get install -y nasm
 
       - name: Create Assembly Source
-        # 起動直後に画面の色設定を強制的に上書きし、黒画面バグを回避します
         run: |
           cat << 'EOF' > source_utf8.asm
           cpu 8086
@@ -27,7 +26,7 @@ jobs:
 
           section .text
           start:
-              ; --- セグメントの安全な初期化 ---
+              ; --- セグメント初期化 (IPLロード位置 1FC0:0000) ---
               cli
               mov ax, cs
               mov ds, ax
@@ -36,38 +35,31 @@ jobs:
               mov sp, 0xFFFE
               sti
 
-              ; --- 起動確認音 (ピポッ) ---
-              ; 画面が真っ暗でも、音が鳴れば「動いている」とわかります
-              mov ah, 0x18
-              mov dx, 0
-              int 0x18
-
-              ; --- 画面モードの強制リセット ---
+              ; --- 画面モードのリセット ---
               mov ah, 0x0A
               mov al, 0x00    ; 400ラインモード
               int 0x18
 
-              ; --- VRAM全消去 ---
+              ; --- VRAMクリア ---
               mov ah, 0x16
               mov dx, 0
               int 0x18
 
-              ; --- カーソル表示 ---
+              ; --- カーソル設定 ---
               mov ah, 0x13
               mov dx, 1       ; 表示ON
               mov cx, 0x0000
               int 0x18
               
-              ; --- テキスト色を「白」に強制固定 ---
-              ; 一部のエミュレータで文字色が黒になるのを防ぐため
-              ; テキストアトリビュート領域(A200:0000)を直接書き換えます
+              ; --- 【重要】文字色の強制設定 ---
+              ; 黒背景・白文字(0xE1) で画面全体を塗りつぶす
               push es
-              mov ax, 0xA200  ; テキスト属性セグメント
+              mov ax, 0xA200
               mov es, ax
-              xor di, di      ; オフセット 0
-              mov cx, 4000    ; 画面全体分
-              mov al, 0xE1    ; 属性: 背景=青(E), 文字=白(1)
-              rep stosb       ; 書き込み実行
+              xor di, di
+              mov cx, 4000    ; 80x25x2bytes
+              mov al, 0xE1
+              rep stosb
               pop es
 
               ; --- メッセージ表示 ---
@@ -78,7 +70,7 @@ jobs:
               or al, al
               jz wait_enter
 
-              ; BIOSで文字出力
+              ; BIOSで一文字出力
               mov ah, 0x40
               mov bx, 0
               int 0x18
@@ -148,47 +140,29 @@ jobs:
       - name: Assemble
         run: nasm yuki.asm -f bin -o yuki.bin
 
-      - name: Create D88 Disk Image
-        # エミュレータが確実に認識するD88ヘッダを付与します
+      - name: Create HDM Image (Standard Raw)
+        # Neko Project IIが最も確実に認識する「Raw形式(.hdm)」を作成します。
+        # サイズを厳密に 1,261,568 bytes (2HD) にすることで、
+        # エミュレータはファイルヘッダ無しでもフロッピーとして認識します。
         run: |
           python3 - <<EOF
-          import struct
+          disk_size = 1261568
           
-          # D88形式のヘッダ (688バイト)
-          header = bytearray(688)
-          
-          # ディスク名 (16バイト)
-          disk_name = b"YUKI_N_BOOT"
-          header[0:len(disk_name)] = disk_name
-          
-          # 0x1A: ライトプロテクトなし(00)
-          # 0x1B: メディア種別 2HD (20)
-          header[0x1B] = 0x20
-          
-          # 0x1C: ディスクサイズ (4バイト)
-          disk_size = 688 + 1261568  # ヘッダ + データ
-          struct.pack_into('<I', header, 0x1C, disk_size)
-          
-          # トラックポインタテーブル (簡易的にすべて0詰めでも多くのエミュは読むが、念のため)
-          # np2 wasmはヘッダさえあればRawとして読んでくれることが多い
-          
-          # バイナリデータの準備
           with open('yuki.bin', 'rb') as f:
               code = f.read()
-              
-          # ディスクデータ本体 (2HD = 1,261,568 bytes)
-          raw_disk = bytearray(1261568)
-          raw_disk[0:len(code)] = code
           
-          with open('YUKI_N.d88', 'wb') as f:
-              f.write(header)
-              f.write(raw_disk)
+          padding = b'\x00' * (disk_size - len(code))
+          
+          # 拡張子を .hdm にします
+          with open('YUKI_N.hdm', 'wb') as f:
+              f.write(code)
+              f.write(padding)
               
-          print("Created YUKI_N.d88")
+          print(f"Created YUKI_N.hdm (Size: {disk_size})")
           EOF
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YUKI_N_D88
-          path: YUKI_N.d88
+          name: YUKI_N_HDM
+          path: YUKI_N.hdm

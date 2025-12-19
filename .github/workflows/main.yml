@@ -1,4 +1,4 @@
-name: PC-98 Auto MIDI Converter
+name: PC-98 Auto MIDI Converter (Fix)
 
 on:
   push:
@@ -12,6 +12,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          lfs: true  # 【重要】LFSで管理されたバイナリファイルを正しく取得する設定
 
       - name: Install Dependencies
         run: |
@@ -26,18 +28,56 @@ jobs:
           import struct
           import glob
           import os
+          import sys
 
           # --- 設定 ---
-          # PC-98のシステムクロック (2.4576MHz)
           MASTER_CLOCK = 2457600
-          # テンポ補正 (エミュレータの速度に合わせて調整してください)
           TIME_SCALE = 30000 
 
           # --- MIDIファイルの検索 ---
           midi_files = glob.glob('*.mid')
-          
+          target_midi = None
+          use_demo = False
+
           if not midi_files:
-              print("No .mid file found. Generating demo.mid...")
+              print("No .mid file found. Will generate demo.")
+              use_demo = True
+          else:
+              # 最初に見つかったファイルを試す
+              candidate = midi_files[0]
+              print(f"Found candidate file: {candidate}")
+              
+              # 【診断】ファイルのヘッダーを確認
+              try:
+                  with open(candidate, 'rb') as f:
+                      header = f.read(4)
+                  print(f"File header hex: {header.hex()}")
+                  
+                  # 'MThd' (4d 54 68 64) で始まっているか確認
+                  if header != b'MThd':
+                      print("Error: File header is not 'MThd'. This is probably a Git LFS pointer or corrupted file.")
+                      # 中身がテキストか確認して表示（デバッグ用）
+                      with open(candidate, 'rb') as f:
+                          print(f"File content preview: {f.read(50)}")
+                      print("Falling back to demo generation.")
+                      use_demo = True
+                  else:
+                      # midoで開けるかテスト
+                      try:
+                          test_load = mido.MidiFile(candidate)
+                          target_midi = candidate
+                          print("MIDI file loaded successfully.")
+                      except Exception as e:
+                          print(f"mido load error: {e}")
+                          use_demo = True
+
+              except Exception as e:
+                  print(f"File read error: {e}")
+                  use_demo = True
+
+          # --- デモ用MIDI生成 (ファイルがない、または壊れている場合) ---
+          if use_demo:
+              print("Generating demo.mid due to missing or invalid source...")
               mid = mido.MidiFile()
               track = mido.MidiTrack()
               mid.tracks.append(track)
@@ -47,79 +87,61 @@ jobs:
                   track.append(mido.Message('note_off', note=note, velocity=64, time=240))
               mid.save('demo.mid')
               target_midi = 'demo.mid'
-          else:
-              target_midi = midi_files[0]
-              print(f"Found MIDI file: {target_midi}")
 
           # --- MIDI解析と変換 ---
-          # 出力フォーマット: [Counter(2byte)] [WaitCount(2byte)] ... [0,0]
           output_data = bytearray()
           
-          # PC-98は単音なので、時間経過を管理しながら単一のトラックにマージします
-          mid = mido.MidiFile(target_midi)
-          
-          # 現在鳴っているノート
-          current_note = None
-          time_accumulator = 0
+          try:
+              mid = mido.MidiFile(target_midi)
+              
+              current_note = None
+              time_accumulator = 0
 
-          for msg in mid:
-              # 時間の累積 (秒単位)
-              time_accumulator += msg.time
+              for msg in mid:
+                  time_accumulator += msg.time
 
-              if msg.type == 'note_on' and msg.velocity > 0:
-                  # --- 前の音(または休符)を書き込む ---
-                  wait_count = int(time_accumulator * TIME_SCALE)
-                  
-                  if wait_count > 0:
-                      if current_note is None:
-                          # 休符 (Counter=0)
-                          output_data += struct.pack('<HH', 0, wait_count)
-                      else:
-                          # 音符
-                          # f = 440 * 2^((note-69)/12)
-                          freq = 440 * (2 ** ((current_note - 69) / 12))
-                          if freq > 0:
+                  if msg.type == 'note_on' and msg.velocity > 0:
+                      wait_count = int(time_accumulator * TIME_SCALE)
+                      
+                      if wait_count > 0:
+                          if current_note is None:
+                              output_data += struct.pack('<HH', 0, wait_count)
+                          else:
+                              freq = 440 * (2 ** ((current_note - 69) / 12))
+                              if freq > 0:
+                                  counter = int(MASTER_CLOCK / freq)
+                                  counter = max(1, min(65535, counter))
+                                  output_data += struct.pack('<HH', counter, wait_count)
+                      
+                      current_note = msg.note
+                      time_accumulator = 0 
+
+                  elif (msg.type == 'note_off') or (msg.type == 'note_on' and msg.velocity == 0):
+                      if current_note == msg.note:
+                          wait_count = int(time_accumulator * TIME_SCALE)
+                          if wait_count > 0:
+                              freq = 440 * (2 ** ((current_note - 69) / 12))
                               counter = int(MASTER_CLOCK / freq)
-                              # 16bit範囲内に収める
                               counter = max(1, min(65535, counter))
                               output_data += struct.pack('<HH', counter, wait_count)
-                  
-                  # 新しい音を開始
-                  current_note = msg.note
-                  time_accumulator = 0 # 時間リセット
+                          
+                          current_note = None
+                          time_accumulator = 0
 
-              elif (msg.type == 'note_off') or (msg.type == 'note_on' and msg.velocity == 0):
-                  # ノートオフの場合、現在鳴っている音が自分なら音を止める
-                  if current_note == msg.note:
-                      # --- 今までの音を書き込む ---
-                      wait_count = int(time_accumulator * TIME_SCALE)
-                      if wait_count > 0:
-                          # 音符書き込み
-                          freq = 440 * (2 ** ((current_note - 69) / 12))
-                          counter = int(MASTER_CLOCK / freq)
-                          counter = max(1, min(65535, counter))
-                          output_data += struct.pack('<HH', counter, wait_count)
-                      
-                      current_note = None # 音なし状態へ
-                      time_accumulator = 0
-
-          # 最後の余韻
-          wait_count = int(time_accumulator * TIME_SCALE)
-          if wait_count > 0:
-              if current_note:
-                  freq = 440 * (2 ** ((current_note - 69) / 12))
-                  counter = int(MASTER_CLOCK / freq)
-                  output_data += struct.pack('<HH', counter, wait_count)
-              else:
+              wait_count = int(time_accumulator * TIME_SCALE)
+              if wait_count > 0:
                   output_data += struct.pack('<HH', 0, wait_count)
 
-          # 終了マーカー
-          output_data += struct.pack('<HH', 0, 0)
+              output_data += struct.pack('<HH', 0, 0)
 
-          with open('music.bin', 'wb') as f:
-              f.write(output_data)
-          
-          print(f"Conversion Complete. Binary size: {len(output_data)} bytes")
+              with open('music.bin', 'wb') as f:
+                  f.write(output_data)
+              
+              print(f"Conversion Complete. Binary size: {len(output_data)} bytes")
+
+          except Exception as e:
+              print(f"Critical Error during conversion: {e}")
+              sys.exit(1)
           EOF
 
       - name: Create Assembly Player
@@ -138,7 +160,6 @@ jobs:
               mov sp, 0xFFFE
               sti
 
-              ; --- 画面設定 (黒背景・文字表示) ---
               mov ah, 0x0A
               mov al, 0x00
               int 0x18
@@ -150,74 +171,56 @@ jobs:
               mov cx, 0x0000
               int 0x18
 
-              ; --- タイトル表示 ---
               mov si, title_msg
               call print_string
 
-              ; --- 再生開始 ---
               mov si, music_data
           
           play_loop:
-              ; データ読み込み [Counter(2)][Wait(2)]
-              lodsw           ; AX = Counter
+              lodsw
               mov bx, ax
-              lodsw           ; AX = WaitCount
+              lodsw
               mov cx, ax
 
-              ; 終了判定 (両方0)
               mov dx, bx
               or dx, cx
               jz stop_music
 
-              ; 音程判定 (Counter=0 は休符)
               cmp bx, 0
               je silence
 
-              ; --- 音を鳴らす (PIT設定) ---
               push ax
-              
-              ; 1. Beep ON (Port 37h bit3=1)
               mov dx, 0x37
               mov al, 0x06
               out dx, al
 
-              ; 2. PIT Mode (Counter 1, Square Wave)
               mov dx, 0x77
               mov al, 0x76
               out dx, al
 
-              ; 3. Frequency Data
               mov dx, 0x73
-              mov al, bl      ; Low Byte
+              mov al, bl
               out dx, al
-              mov al, bh      ; High Byte
+              mov al, bh
               out dx, al
-              
               pop ax
               jmp do_wait
 
           silence:
-              ; 音を止める
               mov dx, 0x37
               mov al, 0x0F
               out dx, al
 
           do_wait:
-              ; ウェイト処理 (CX回ループ)
-              ; I/Oポートアクセスで時間を稼ぐ
           wait_loop:
               in al, 0x60
               loop wait_loop
-
               jmp play_loop
 
           stop_music:
-              ; 完全に音を止める
               mov dx, 0x37
               mov al, 0x0F
               out dx, al
-              
-              ; 完了メッセージ
               mov si, done_msg
               call print_string
               
@@ -226,7 +229,6 @@ jobs:
               hlt
               jmp halt_cpu
 
-          ; --- 文字列表示ルーチン ---
           print_string:
               mov ah, 0x40
               mov bx, 0
@@ -241,13 +243,9 @@ jobs:
 
           section .data
           title_msg:
-              db "PC-98 MIDI PLAYER", 0x0D, 0x0A
-              db "Converting and Playing...", 0x0D, 0x0A, 0
-          
+              db "PC-98 MIDI PLAYER", 0x0D, 0x0A, 0
           done_msg:
-              db 0x0D, 0x0A, "Playback Finished.", 0x0D, 0x0A, 0
-
-          ; Pythonで変換した音楽データを取り込む
+              db 0x0D, 0x0A, "Finished.", 0x0D, 0x0A, 0
           music_data:
               incbin "music.bin"
           EOF
@@ -261,11 +259,6 @@ jobs:
           disk_size = 1261568
           with open('player.bin', 'rb') as f:
               code = f.read()
-          
-          # 容量チェック
-          if len(code) > disk_size:
-              print("Warning: MIDI data is too large for floppy disk!")
-          
           padding = b'\x00' * (disk_size - len(code))
           with open('PLAYER.hdm', 'wb') as f:
               f.write(code)

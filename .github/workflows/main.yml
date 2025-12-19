@@ -1,4 +1,4 @@
-name: Build Win95 Extractor (Open Watcom V2 Fixed)
+name: Build Win95 Extractor (Open Watcom V2 Fixed C89)
 
 on:
   push:
@@ -15,21 +15,18 @@ jobs:
 
       - name: Setup Open Watcom V2
         run: |
-          # 正しいURL (.tar.xz) からダウンロード
+          # .tar.xz 形式をダウンロード
           wget https://github.com/open-watcom/open-watcom-v2/releases/download/Last-CI-build/ow-snapshot.tar.xz
           
-          # 解凍用ディレクトリ作成
           mkdir watcom
-          
-          # .tar.xz 形式を解凍 (Jオプションまたは自動判別のxfを使用)
+          # xz形式を解凍
           tar -xf ow-snapshot.tar.xz -C watcom
           
-          # 実行権限の付与 (Linuxホスト用バイナリ)
           chmod +x watcom/binl64/*
 
-      - name: Create C Source Code
+      - name: Create C Source Code (C89 Compatible)
         run: |
-          # Windows 95のメモリ制約(とファイルシステムの遅さ)を考慮したコード生成
+          # 変数宣言を全て関数の先頭に移動した修正版コード
           cat << 'EOF' > extractor.c
           #include <windows.h>
           #include <stdio.h>
@@ -37,16 +34,26 @@ jobs:
           #include <string.h>
 
           #define DEST_DIR "C:\\SAYONARA"
-          
-          // Win95実機でのメモリ不足回避のため20MB以上のファイルはスキップ
           #define MAX_FILE_SIZE (20 * 1024 * 1024)
 
           void ExtractImages(char *filepath, char *filename) {
-              FILE *fp = fopen(filepath, "rb");
+              // --- C89準拠: 変数宣言は必ず関数の先頭に書く ---
+              FILE *fp;
+              FILE *out;
+              long filesize;
+              unsigned char *buffer;
+              int count = 0;
+              long i = 0;
+              long start, end, j;
+              unsigned long bmpSize, headerSize;
+              char outpath[MAX_PATH];
+              // ------------------------------------------
+
+              fp = fopen(filepath, "rb");
               if (!fp) return;
 
               fseek(fp, 0, SEEK_END);
-              long filesize = ftell(fp);
+              filesize = ftell(fp);
               fseek(fp, 0, SEEK_SET);
 
               if (filesize > MAX_FILE_SIZE) {
@@ -55,7 +62,7 @@ jobs:
                   return;
               }
 
-              unsigned char *buffer = (unsigned char *)malloc(filesize);
+              buffer = (unsigned char *)malloc(filesize);
               if (!buffer) {
                   printf("Skip (No Mem): %s\n", filename);
                   fclose(fp);
@@ -65,41 +72,48 @@ jobs:
               fread(buffer, 1, filesize, fp);
               fclose(fp);
 
-              int count = 0;
-              long i = 0;
-              char outpath[MAX_PATH];
-              
               printf("Scanning: %s\n", filename);
 
               while (i < filesize - 6) {
                   // BMP (BM) Header Search
                   if (buffer[i] == 'B' && buffer[i+1] == 'M') {
-                      unsigned long bmpSize = *(unsigned long *)&buffer[i + 2];
-                      // バッファオーバーラン防止チェック
+                      bmpSize = *(unsigned long *)&buffer[i + 2];
+                      
                       if (bmpSize > 54 && (i + bmpSize) <= filesize) {
-                          unsigned long headerSize = *(unsigned long *)&buffer[i + 14];
+                          headerSize = *(unsigned long *)&buffer[i + 14];
                           // Win3.1/95 (40) or OS/2 (12) header
                           if (headerSize == 40 || headerSize == 12) {
                               sprintf(outpath, "%s\\%s_%04d.bmp", DEST_DIR, filename, count++);
-                              FILE *out = fopen(outpath, "wb");
-                              if (out) { fwrite(&buffer[i], 1, bmpSize, out); fclose(out); i += bmpSize - 1; }
+                              out = fopen(outpath, "wb");
+                              if (out) { 
+                                  fwrite(&buffer[i], 1, bmpSize, out); 
+                                  fclose(out); 
+                                  i += bmpSize - 1; 
+                              }
                           }
                       }
                   }
                   // JPEG (FF D8 ... FF D9) Search
                   else if (buffer[i] == 0xFF && buffer[i+1] == 0xD8) {
-                      long start = i;
-                      long end = -1;
-                      long j = start + 2;
-                      // EOI探索
+                      start = i;
+                      end = -1;
+                      j = start + 2;
+                      
                       while (j < filesize - 1) {
-                          if (buffer[j] == 0xFF && buffer[j+1] == 0xD9) { end = j + 2; break; }
+                          if (buffer[j] == 0xFF && buffer[j+1] == 0xD9) { 
+                              end = j + 2; 
+                              break; 
+                          }
                           j++;
                       }
                       if (end != -1 && (end - start > 100)) {
                           sprintf(outpath, "%s\\%s_%04d.jpg", DEST_DIR, filename, count++);
-                          FILE *out = fopen(outpath, "wb");
-                          if (out) { fwrite(&buffer[start], 1, end - start, out); fclose(out); i = end - 1; }
+                          out = fopen(outpath, "wb");
+                          if (out) { 
+                              fwrite(&buffer[start], 1, end - start, out); 
+                              fclose(out); 
+                              i = end - 1; 
+                          }
                       }
                   }
                   i++;
@@ -109,6 +123,7 @@ jobs:
           }
 
           int main() {
+              // main関数も同様に宣言を先頭へ
               WIN32_FIND_DATA findFileData;
               HANDLE hFind;
               char searchPath[MAX_PATH];
@@ -117,7 +132,7 @@ jobs:
 
               if (!CreateDirectory(DEST_DIR, NULL)) {
                   if (GetLastError() != ERROR_ALREADY_EXISTS) {
-                      printf("Note: Output folder already exists or error.\n");
+                      printf("Note: Output folder check skipped.\n");
                   }
               }
 
@@ -145,18 +160,15 @@ jobs:
 
       - name: Compile with Open Watcom
         run: |
-          # 環境変数の設定
           export WATCOM=$PWD/watcom
           export PATH=$WATCOM/binl64:$WATCOM/binw:$PATH
           export INCLUDE=$WATCOM/h:$WATCOM/h/nt
 
           # コンパイル実行
-          # -l=nt : Windows 95/NT用ターゲット
-          # -3r   : 386プロセッサ用コード生成 (Win95互換性の要)
           wcl386 extractor.c -l=nt -3r -fe=sayonara95.exe
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SayonaraExtractor-Win95-Fixed
+          name: SayonaraExtractor-Win95-Final
           path: sayonara95.exe

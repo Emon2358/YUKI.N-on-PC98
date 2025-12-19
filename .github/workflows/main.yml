@@ -1,4 +1,4 @@
-name: Build PC-98 HDI (YUKI.N)
+name: Build PC-98 Floppy Image (YUKI.N)
 
 on:
   push:
@@ -19,32 +19,38 @@ jobs:
           sudo apt-get install -y nasm
 
       - name: Create Assembly Source (UTF-8)
-        # ここでアセンブリコードを生成します。
-        # PC-98のBIOS (INT 18h) を使用して文字描画とキー入力を制御します。
+        # BIOSがFDDを読み込む際の挙動に合わせて、セグメント設定を強化しました
         run: |
           cat << 'EOF' > source_utf8.asm
           cpu 8086
           org 0x0000
 
           section .text
+              ; --- セグメント正規化 ---
+              ; BIOSによっては CS:IP = 1FC0:0000 などで渡されることがあるため
+              ; 強制的に CS=0000 にジャンプします。
+              jmp 0x0000:start
+          
           start:
-              ; --- セグメント初期化 ---
               cli
               xor ax, ax
               mov ds, ax
               mov es, ax
               mov ss, ax
-              mov sp, 0x7C00
+              mov sp, 0x7C00 ; スタック位置
               sti
 
-              ; --- 画面クリア (INT 18h, AH=16h) ---
-              mov ah, 0x16
-              mov dx, 0      ; コマンド: VRAMクリア
+              ; --- 画面モード設定とクリア ---
+              ; テキストモードを確実に有効化
+              mov ah, 0x0A ; CRTモード設定非表示
+              int 0x18
+              
+              mov ah, 0x16 ; VRAMクリア
+              mov dx, 0
               int 0x18
 
-              ; --- カーソル初期化 (INT 18h, AH=13h) ---
-              mov ah, 0x13
-              mov dx, 0      ; カーソル表示ON, 位置(0,0)
+              mov ah, 0x13 ; カーソル初期化
+              mov dx, 0
               int 0x18
 
               ; --- メッセージ表示ループ ---
@@ -52,55 +58,46 @@ jobs:
           
           char_loop:
               lodsb           ; AL = [SI], SI++
-              or al, al       ; 終了判定 (null terminator)
+              or al, al       ; 終了判定
               jz wait_enter
 
-              ; --- 一文字描画 (INT 18h, AH=40h: TEXT WRITE) ---
-              ; 注: エスケープシーケンスや制御コードは最小限にし、単純なTTY出力として扱います
+              ; --- 一文字描画 (INT 18h, AH=40h) ---
               mov ah, 0x40
-              mov bx, 0       ; ページ0
+              mov bx, 0
               int 0x18
               
-              ; --- ウェイト (演出用) ---
+              ; --- ウェイト ---
               call delay_short
 
               jmp char_loop
 
           wait_enter:
-              ; --- キー入力待ち (INT 18h, AH=00h) ---
+              ; --- キー入力待ち ---
               mov ah, 0x00
               int 0x18
-              ; AH=スキャンコード, AL=ASCIIコード
-              ; Enterキー (CR) は ASCII 0x0D
+              ; Enterキー (CR=0x0D) かチェック
               cmp al, 0x0D
-              jne wait_enter  ; Enter以外なら待ち続ける
+              jne wait_enter
 
           shutdown:
-              ; --- シャットダウン (擬似) ---
-              ; PC-98のベアメタルで電源断は機種依存ですが、
-              ; ここでは画面をクリアしてCPUを停止(HLT)させます。
-              
-              ; 画面クリア
+              ; --- 終了処理 ---
+              ; 画面をクリアして停止
               mov ah, 0x16
               mov dx, 0
               int 0x18
 
-              ; 終了メッセージ (オプション)
-              ; System Halted.
-
               cli
-          hlt_loop:
               hlt
+          hlt_loop:
               jmp hlt_loop
 
           ; --- ウェイトルーチン ---
-          ; エミュレータの速度に依存しますが、空ループで遅延させます
           delay_short:
               push cx
-              mov cx, 0xFFFF  ; ウェイト回数 (適宜調整)
+              mov cx, 0x8000  ; 速度調整
           dloop1:
               push cx
-              mov cx, 0x0010  ; インナーループ
+              mov cx, 0x0010
           dloop2:
               loop dloop2
               pop cx
@@ -109,8 +106,7 @@ jobs:
               ret
 
           section .data
-          ; メッセージ定義
-          ; 改行は 0x0D, 0x0A
+          ; メッセージ (Shift_JIS変換前)
           message_data:
               db "YUKI.N> これをあなたが読んでいる時、", 0x0D, 0x0A
               db "わたしはわたしではないだろう。", 0x0D, 0x0A
@@ -139,75 +135,37 @@ jobs:
           EOF
 
       - name: Convert Encoding (UTF-8 to Shift_JIS)
-        # PC-98はShift_JIS (CP932) である必要があるため変換します
         run: |
           iconv -f UTF-8 -t SHIFT-JIS source_utf8.asm -o yuki.asm
 
       - name: Assemble
-        # IPL (Initial Program Loader) として動作するようにバイナリを生成
         run: |
           nasm yuki.asm -f bin -o yuki.bin
 
-      - name: Create HDI Image
-        # PythonスクリプトでAnex86形式のヘッダを付与してHDI化します
+      - name: Create Floppy Image (2HD)
+        # PC-98の標準的なフロッピー形式 (2HD, 1.2MB) のイメージを作成します
+        # サイズを 1261568 バイト (1024バイト/セクタ * 8セクタ * 2ヘッド * 77シリンダ) に合わせます
         run: |
           python3 - <<EOF
-          import struct
-
-          # HDDパラメータ (容量小さめの設定)
-          cylinders = 10
-          heads = 2
-          sectors = 8
-          sector_size = 512
+          disk_size = 1261568
           
-          # Anex86 HDI Header (512 bytes)
-          # Offset 0: Header Signature (T98HDDIMAGE.R01) or similar isn't strictly checked by all,
-          # but let's stick to a minimal valid raw header structure often used.
-          # Actually, many emulators (NP2) treat a file as HDI if it has a specific header.
-          # We will create a "Anex86" style header.
-          
-          header = bytearray(512)
-          # 32bit integers (Little Endian)
-          # 0x00: Header Size (usually 4096 or 512, Anex86 uses 512 often for simple images)
-          # But strictly, Anex86 format is:
-          # 0-3: 0 (Progress format?) or signature? 
-          # Let's use a simpler approach: T98-Next / Anex86 often assume raw if size matches C*H*S*512.
-          # However, to be "HDI", we usually add the 512 byte header.
-          
-          # 0x000: Headersize (4 bytes) = 512 (0x200)
-          struct.pack_into('<I', header, 0x00, 512) 
-          # 0x004: Cylinders
-          struct.pack_into('<I', header, 0x04, cylinders)
-          # 0x008: Heads
-          struct.pack_into('<I', header, 0x08, heads)
-          # 0x00C: Sectors
-          struct.pack_into('<I', header, 0x0C, sectors)
-          # 0x010: Sector Size
-          struct.pack_into('<I', header, 0x10, sector_size)
-          
-          # Load the binary code
           with open('yuki.bin', 'rb') as f:
               code = f.read()
           
-          # PC-98 IPL is loaded at 0000:0000 (up to size of track usually).
-          # The binary needs to be placed immediately after the header.
+          # コードがディスクサイズを超えていないかチェック
+          if len(code) > disk_size:
+              raise ValueError("Code is too large for the disk image")
           
-          total_size = cylinders * heads * sectors * sector_size
-          disk_data = bytearray(total_size)
-          
-          # Copy code to the beginning of the disk area
-          disk_data[0:len(code)] = code
-          
-          # Write Final HDI
-          with open('YUKI_N.hdi', 'wb') as f:
-              f.write(header)
-              f.write(disk_data)
-          
-          print(f"Created YUKI_N.hdi with size {len(header) + len(disk_data)} bytes")
+          # バイナリを書き込み、残りを0x00で埋める
+          with open('YUKI_N.fdi', 'wb') as f:
+              f.write(code)
+              f.write(b'\x00' * (disk_size - len(code)))
+              
+          print(f"Created YUKI_N.fdi with size {disk_size} bytes")
           EOF
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YUKI_N_HDI
-          path: YUKI_N.hdi
+          name: YUKI_N_FDI
+          path: YUKI_N.fdi

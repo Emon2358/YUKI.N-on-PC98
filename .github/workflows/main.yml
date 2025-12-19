@@ -1,4 +1,4 @@
-name: Build Win95 Extractor (Low Memory Version)
+name: Build Win95 Extractor (Stable Version)
 
 on:
   push:
@@ -20,7 +20,7 @@ jobs:
           tar -xf ow-snapshot.tar.xz -C watcom
           chmod +x watcom/binl64/*
 
-      - name: Create C Source Code (Low Memory / Streaming)
+      - name: Create C Source Code (Stable & Static Memory)
         run: |
           cat << 'EOF' > extractor.c
           #include <windows.h>
@@ -29,138 +29,146 @@ jobs:
           #include <string.h>
 
           #define DEST_DIR "C:\\SAYONARA"
-          // バッファサイズを64KBに抑える（Win95に優しい設計）
-          #define CHUNK_SIZE (64 * 1024)
+          
+          // バッファを静的に確保 (mallocを使わないのでメモリ不足エラーが出ない)
+          // 16KBあればWin95でも余裕で動作します
+          #define BUF_SIZE 16384
+          static unsigned char buffer[BUF_SIZE];
 
-          // 補助関数: ファイルの一部を切り出して保存する
-          void SaveImageChunk(FILE *fpSource, long offset, long size, char *outpath) {
+          // 画像データをファイルに書き出す関数
+          void WriteImageFile(char *filename, unsigned char *header, int headerSize, FILE *fpIn, long imageSize) {
               FILE *fpOut;
-              unsigned char *copyBuf;
-              long bytesLeft = size;
-              long readNow;
-              long originalPos;
-
-              // 現在位置を保存
-              originalPos = ftell(fpSource);
+              long remain = imageSize - headerSize;
+              long readLen;
               
-              // 画像の開始位置へ移動
-              fseek(fpSource, offset, SEEK_SET);
+              // 書き出し開始
+              fpOut = fopen(filename, "wb");
+              if (!fpOut) return;
 
-              fpOut = fopen(outpath, "wb");
-              if (fpOut) {
-                  // コピー用バッファ確保
-                  copyBuf = (unsigned char *)malloc(4096); 
-                  if (copyBuf) {
-                      while (bytesLeft > 0) {
-                          readNow = (bytesLeft > 4096) ? 4096 : bytesLeft;
-                          fread(copyBuf, 1, readNow, fpSource);
-                          fwrite(copyBuf, 1, readNow, fpOut);
-                          bytesLeft -= readNow;
-                      }
-                      free(copyBuf);
-                  }
-                  fclose(fpOut);
-                  printf("Saved: %s\n", outpath);
+              // まずヘッダー部分（バッファにある分）を書き出す
+              fwrite(header, 1, headerSize, fpOut);
+
+              // 残りのデータをファイルから読んで書き出す（1バイトずつコピーだと遅いのでバッファ経由）
+              while (remain > 0) {
+                  readLen = (remain > BUF_SIZE) ? BUF_SIZE : remain;
+                  // ファイルから直接読み込む
+                  if (fread(buffer, 1, readLen, fpIn) != readLen) break;
+                  fwrite(buffer, 1, readLen, fpOut);
+                  remain -= readLen;
               }
-
-              // 元の位置に戻る
-              fseek(fpSource, originalPos, SEEK_SET);
+              fclose(fpOut);
           }
 
-          void ScanFile(char *filename) {
+          void ScanAndExtract(char *fname) {
               FILE *fp;
-              unsigned char *buffer;
-              long filesize;
-              long pos = 0;
-              int readSize;
+              long fileSize;
+              long currentPos = 0;
+              int bytesRead;
               int i;
               int count = 0;
-              char outpath[MAX_PATH];
               
-              // C89宣言対応
-              unsigned long bmpSize, headerSize;
+              // C89対応: 変数宣言は先頭
+              unsigned long bmpSize;
               long jpgStart, jpgEnd;
+              int j;
+              char outName[MAX_PATH];
 
-              fp = fopen(filename, "rb");
-              if (!fp) {
-                  printf("Cannot open: %s\n", filename);
-                  return;
-              }
+              fp = fopen(fname, "rb");
+              if (!fp) return;
 
               // ファイルサイズ取得
               fseek(fp, 0, SEEK_END);
-              filesize = ftell(fp);
+              fileSize = ftell(fp);
               fseek(fp, 0, SEEK_SET);
 
-              printf("Scanning: %s (%ld bytes)\n", filename, filesize);
+              printf("Scanning: %s\n", fname);
 
-              // 検索用バッファ確保 (64KB)
-              buffer = (unsigned char *)malloc(CHUNK_SIZE);
-              if (!buffer) {
-                  printf("Memory Error!\n");
-                  fclose(fp);
-                  return;
-              }
+              // メインループ: ファイルを前から順にバッファに読み込む
+              while (currentPos < fileSize) {
+                  // 現在位置を記憶
+                  long loopStartPos = ftell(fp);
+                  
+                  bytesRead = fread(buffer, 1, BUF_SIZE, fp);
+                  if (bytesRead < 4) break;
 
-              // ストリーミング処理ループ
-              while (pos < filesize) {
-                  // ファイルポインタ移動
-                  fseek(fp, pos, SEEK_SET);
-                  readSize = fread(buffer, 1, CHUNK_SIZE, fp);
-                  if (readSize < 6) break;
-
-                  for (i = 0; i < readSize - 6; i++) {
-                      long currentAbsPos = pos + i;
-
+                  for (i = 0; i < bytesRead - 4; i++) {
+                      
                       // --- BMP (BM) 検出 ---
                       if (buffer[i] == 'B' && buffer[i+1] == 'M') {
                           bmpSize = *(unsigned long *)&buffer[i + 2];
-                          // 妥当性チェック
-                          if (bmpSize > 54 && bmpSize < 10000000) {
-                              if (currentAbsPos + bmpSize <= filesize) {
-                                  headerSize = *(unsigned long *)&buffer[i + 14];
-                                  if (headerSize == 40 || headerSize == 12) {
-                                      sprintf(outpath, "%s\\%s_%04d.bmp", DEST_DIR, filename, count++);
-                                      SaveImageChunk(fp, currentAbsPos, bmpSize, outpath);
-                                      // 見つけた画像の分だけスキップしたいが、
-                                      // バッファ管理が複雑になるので、ここでは単純にインデックスを進める
-                                      i += 14; 
-                                  }
+                          
+                          // サイズ妥当性チェック (誤検出防止)
+                          if (bmpSize > 54 && bmpSize < 5000000) {
+                              // ファイルからはみ出さないかチェック
+                              if (loopStartPos + i + bmpSize <= fileSize) {
+                                  sprintf(outName, "%s\\%s_%04d.bmp", DEST_DIR, fname, count++);
+                                  printf(" Found BMP: %s\n", outName);
+
+                                  // ファイルポインタを画像の先頭へ移動
+                                  fseek(fp, loopStartPos + i, SEEK_SET);
+                                  
+                                  // 画像として抽出・保存 (この関数内でファイルポインタが進む)
+                                  WriteImageFile(outName, NULL, 0, fp, bmpSize);
+                                  
+                                  // 処理が終わったらループを抜けて、バッファを読み直す
+                                  // (ファイルポインタは画像末尾にあるので、そこから再開)
+                                  goto RESTART_LOOP;
                               }
                           }
                       }
+                      
                       // --- JPEG (FF D8) 検出 ---
                       else if (buffer[i] == 0xFF && buffer[i+1] == 0xD8) {
-                          // ここから簡易的なEOI探索 (バッファ内のみ検索)
-                          // 注意: 巨大なJPEGやバッファをまたぐJPEGはこの簡易版では拾えない場合がありますが、
-                          // Win95時代のゲーム素材は小さいので多くの場合はこれで拾えます。
-                          // 本格的な解析には複雑なステートマシンが必要ですが、今回は安定性重視です。
-                          int j;
-                          int foundEnd = 0;
-                          long jSize = 0;
-
-                          for (j = i + 2; j < readSize - 1; j++) {
-                              if (buffer[j] == 0xFF && buffer[j+1] == 0xD9) {
-                                  jSize = (j + 2) - i;
-                                  foundEnd = 1;
-                                  break;
+                          // 簡易チェック
+                          if (buffer[i+2] == 0xFF) {
+                              sprintf(outName, "%s\\%s_%04d.jpg", DEST_DIR, fname, count++);
+                              printf(" Found JPG start: %s\n", outName);
+                              
+                              // JPEGはサイズが書いてないので、EOI(FF D9)までコピーする特別処理が必要
+                              // Win95環境での安定性のため、ここでは固定サイズではなく
+                              // 「FF D9が見つかるまで書く」ロジックにする
+                              
+                              fseek(fp, loopStartPos + i, SEEK_SET);
+                              
+                              {
+                                  FILE *fpOut = fopen(outName, "wb");
+                                  int lastByte = 0;
+                                  int thisByte;
+                                  long safetyCount = 0;
+                                  if (fpOut) {
+                                      // 1バイトずつコピー (遅いが確実)
+                                      while (safetyCount < 1000000) { // 1MB制限
+                                          thisByte = fgetc(fp);
+                                          if (thisByte == EOF) break;
+                                          fputc(thisByte, fpOut);
+                                          
+                                          if (lastByte == 0xFF && thisByte == 0xD9) {
+                                              break; // EOI発見
+                                          }
+                                          lastByte = thisByte;
+                                          safetyCount++;
+                                      }
+                                      fclose(fpOut);
+                                  }
                               }
-                          }
-                          
-                          if (foundEnd && jSize > 100) {
-                              sprintf(outpath, "%s\\%s_%04d.jpg", DEST_DIR, filename, count++);
-                              SaveImageChunk(fp, currentAbsPos, jSize, outpath);
-                              i = j; // 進める
+                              goto RESTART_LOOP;
                           }
                       }
                   }
 
-                  // 次のブロックへ (重なりを考慮して少し戻る)
-                  // ※JPEGヘッダ探索漏れを防ぐため 1KB 戻して読む
-                  pos += (CHUNK_SIZE - 1024);
+                  // 何も見つからなければ、次のバッファへ
+                  // ただし、ヘッダがバッファ境界で切れるのを防ぐため、少し戻る
+                  if (currentPos + bytesRead < fileSize) {
+                      fseek(fp, loopStartPos + bytesRead - 64, SEEK_SET);
+                  }
+                  currentPos = ftell(fp);
+                  continue;
+
+              RESTART_LOOP:
+                  // 画像抽出後、ここに戻ってくる
+                  currentPos = ftell(fp);
               }
 
-              free(buffer);
               fclose(fp);
           }
 
@@ -169,33 +177,31 @@ jobs:
               HANDLE hFind;
               char searchPath[MAX_PATH];
 
-              printf("\n=== SAYONARA EXTRACTOR (Low Memory Mode) ===\n");
-              printf("Output: %s\n", DEST_DIR);
+              printf("\n=== SAYONARA EXTRACTOR (Win95 Stable) ===\n");
 
               if (!CreateDirectory(DEST_DIR, NULL)) {
-                  // エラーコードを受け取るが、既に存在する場合は無視
+                  // エラーでも続行
               }
+              printf("Save to: %s\n", DEST_DIR);
 
               GetCurrentDirectory(MAX_PATH, searchPath);
               strcat(searchPath, "\\*.*");
 
               hFind = FindFirstFile(searchPath, &findFileData);
               if (hFind == INVALID_HANDLE_VALUE) {
-                  printf("Error: No files found in current directory.\n");
-                  printf("Press Enter to exit.\n");
+                  printf("No files found.\n");
                   getchar();
                   return 1;
               }
 
               do {
                   if (!(findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                      // 自分のEXE自身や小さいファイルは無視してもよいが、念の為全部スキャン
-                      ScanFile(findFileData.cFileName);
+                      ScanAndExtract(findFileData.cFileName);
                   }
               } while (FindNextFile(hFind, &findFileData));
 
               FindClose(hFind);
-              printf("\nAll Done! Press Enter to exit.\n");
+              printf("\nDone! Press Enter to exit.\n");
               getchar();
               return 0;
           }
@@ -207,14 +213,12 @@ jobs:
           export PATH=$WATCOM/binl64:$WATCOM/binw:$PATH
           export INCLUDE=$WATCOM/h:$WATCOM/h/nt
           
-          # コンパイルオプション解説
-          # -l=nt : Windows NT/9x用
-          # -3r   : 80386用コード
-          # -os   : サイズ優先最適化 (メモリ節約)
-          wcl386 extractor.c -l=nt -3r -os -fe=sayonara95.exe
+          # -os: サイズ最適化
+          # -s: スタックサイズ調整 (念のため)
+          wcl386 extractor.c -l=nt -3r -os -k8192 -fe=sayonara95.exe
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SayonaraExtractor-Final
+          name: SayonaraExtractor-Stable
           path: sayonara95.exe

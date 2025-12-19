@@ -1,4 +1,4 @@
-name: Build PC-98 HDM Image
+name: Build PC-98 Force Display (English/HDM)
 
 on:
   push:
@@ -26,7 +26,6 @@ jobs:
 
           section .text
           start:
-              ; --- セグメント初期化 (IPLロード位置 1FC0:0000) ---
               cli
               mov ax, cs
               mov ds, ax
@@ -35,134 +34,114 @@ jobs:
               mov sp, 0xFFFE
               sti
 
-              ; --- 画面モードのリセット ---
-              mov ah, 0x0A
-              mov al, 0x00    ; 400ラインモード
-              int 0x18
-
-              ; --- VRAMクリア ---
-              mov ah, 0x16
+              ; --- 1. 起動音 (動いているかの確認) ---
+              mov ah, 0x18
               mov dx, 0
               int 0x18
 
-              ; --- カーソル設定 ---
-              mov ah, 0x13
-              mov dx, 1       ; 表示ON
-              mov cx, 0x0000
+              ; --- 2. 画面モード初期化 ---
+              mov ah, 0x0A
+              mov al, 0x00    ; 400ライン
               int 0x18
+
+              ; --- 3. 画面を「青背景・白文字」で埋め尽くす ---
+              ; BIOSのclsではなく、直接メモリを書き換えて色を強制します
               
-              ; --- 【重要】文字色の強制設定 ---
-              ; 黒背景・白文字(0xE1) で画面全体を塗りつぶす
-              push es
+              ; テキストVRAM (文字コード) のクリア
+              mov ax, 0xA000
+              mov es, ax
+              xor di, di
+              mov cx, 2000    ; 2000文字分
+              mov al, 0x20    ; スペース
+              rep stosb
+
+              ; テキスト属性 (色) の強制設定
               mov ax, 0xA200
               mov es, ax
               xor di, di
-              mov cx, 4000    ; 80x25x2bytes
-              mov al, 0xE1
+              mov cx, 2000
+              ; 属性バイト: 0xE1 (背景=青, 文字=白, 点滅なし)
+              ; これで画面全体が「青く」なるはずです
+              mov al, 0xE1    
               rep stosb
-              pop es
 
-              ; --- メッセージ表示 ---
+              ; --- 4. 文字を表示 (英語のみ) ---
+              ; 漢字ROMがない可能性を考慮し、ASCIIだけで書きます
               mov si, message_data
-          
-          char_loop:
-              lodsb
-              or al, al
-              jz wait_enter
-
-              ; BIOSで一文字出力
-              mov ah, 0x40
-              mov bx, 0
-              int 0x18
+              mov di, 0       ; 画面左上から
               
-              call delay_char
-              jmp char_loop
+              ; セグメント設定: ES=0xA000 (文字VRAM)
+              mov ax, 0xA000
+              mov es, ax
 
-          wait_enter:
-              mov ah, 0x00
-              int 0x18
-              cmp al, 0x0D
-              jne wait_enter
+          print_loop:
+              lodsb           ; 文字読み込み
+              or al, al
+              jz halt_loop    ; 0なら終了
 
-          shutdown:
-              mov ah, 0x16
-              mov dx, 0
-              int 0x18
+              cmp al, 0x0D    ; 改行(CR)処理
+              je newline
+              cmp al, 0x0A    ; 改行(LF)無視
+              je print_loop
+
+              stosb           ; VRAMに書き込み (ES:DI)
+              
+              ; ウェイト（文字が流れる演出）
+              call delay
+              jmp print_loop
+
+          newline:
+              ; 次の行へ (PC-98は1行80文字=80バイト)
+              ; DIの値を次の80の倍数まで進める簡易処理
+              mov ax, di
+              mov cl, 80
+              div cl          ; AX / 80 -> AL=行数, AH=余り
+              inc al          ; 次の行
+              mul cl          ; 行数 * 80
+              mov di, ax      ; 新しい位置
+              jmp print_loop
+
+          halt_loop:
               cli
               hlt
-          hlt_loop:
-              jmp hlt_loop
+              jmp halt_loop
 
-          delay_char:
+          delay:
               push cx
-              mov cx, 0x3000
+              mov cx, 0x4000
           d1:
-              push cx
-              mov cx, 0x0005
-          d2:
-              loop d2
-              pop cx
               loop d1
               pop cx
               ret
 
           section .data
           message_data:
-              db "YUKI.N> これをあなたが読んでいる時、", 0x0D, 0x0A
-              db "わたしはわたしではないだろう。", 0x0D, 0x0A
-              db 0x0D, 0x0A
-              db "YUKI.N> このメッセージが表示されたということは、", 0x0D, 0x0A
-              db "そこには、あなた、わたし、涼宮ハルヒ、朝比奈みくる、", 0x0D, 0x0A
-              db "古泉一樹が存在しているはずである。", 0x0D, 0x0A
-              db 0x0D, 0x0A
-              db "YUKI.N> それが鍵。", 0x0D, 0x0A
-              db "あなたは解答を見つけ出した。", 0x0D, 0x0A
-              db 0x0D, 0x0A
-              db "YUKI.N> これは緊急脱出プログラムである。", 0x0D, 0x0A
-              db "起動させる場合はエンターキーを、", 0x0D, 0x0A
-              db "そうでない場合はそれ以外のキーを選択せよ。", 0x0D, 0x0A
-              db 0x0D, 0x0A
-              db "YUKI.N> 起動させた場合、", 0x0D, 0x0A
-              db "あなたは時空修正の機会を得る。", 0x0D, 0x0A
-              db "ただし成功は保証できない。", 0x0D, 0x0A
-              db "また帰還の保証もできない。", 0x0D, 0x0A
-              db 0x0D, 0x0A
-              db "YUKI.N> このプログラムが起動するのは一度きりである。", 0x0D, 0x0A
-              db "実行ののち、消去される。", 0x0D, 0x0A
-              db "非実行が選択された場合は起動せずに消去される。", 0x0D, 0x0A
-              db 0x0D, 0x0A
-              db "Ready?", 0
+              db "YUKI.N> Reading this means I am no longer me.", 0x0D
+              db 0x0D
+              db "YUKI.N> This message is an emergency escape program.", 0x0D
+              db "YUKI.N> Press ENTER to activate.", 0x0D
+              db 0x0D
+              db "YUKI.N> Good luck.", 0x0D
+              db 0x00
           EOF
 
-      - name: Convert Encoding
-        run: iconv -f UTF-8 -t SHIFT-JIS source_utf8.asm -o yuki.asm
-
       - name: Assemble
-        run: nasm yuki.asm -f bin -o yuki.bin
+        run: nasm source_utf8.asm -f bin -o yuki.bin
 
-      - name: Create HDM Image (Standard Raw)
-        # Neko Project IIが最も確実に認識する「Raw形式(.hdm)」を作成します。
-        # サイズを厳密に 1,261,568 bytes (2HD) にすることで、
-        # エミュレータはファイルヘッダ無しでもフロッピーとして認識します。
+      - name: Create HDM Image
         run: |
           python3 - <<EOF
           disk_size = 1261568
-          
           with open('yuki.bin', 'rb') as f:
               code = f.read()
-          
           padding = b'\x00' * (disk_size - len(code))
-          
-          # 拡張子を .hdm にします
           with open('YUKI_N.hdm', 'wb') as f:
               f.write(code)
               f.write(padding)
-              
-          print(f"Created YUKI_N.hdm (Size: {disk_size})")
           EOF
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YUKI_N_HDM
+          name: YUKI_N_HDM_ForceBlue
           path: YUKI_N.hdm
